@@ -65,6 +65,7 @@ class LlamaMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        #-------
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -72,13 +73,26 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
+        #---
+        # self.down_proj = RowParallelLinearNoComm(
+        #     intermediate_size,
+        #     hidden_size,
+        #     bias=False,
+        #     quant_config=quant_config,
+        #     prefix=add_prefix("down_proj", prefix),
+        # )
+        
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            reduce_results=True,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
+        #-----------------
+        
+        
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -144,13 +158,18 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        
+        #------
+        #nocomm
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=bias,
+            reduce_results=True
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
+        #-----------
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -175,11 +194,19 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        
+        
+        
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
+        
+        
+        
+        
+        
         return output
 
 
@@ -241,6 +268,9 @@ class LlamaDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        # if True:
+        
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -256,6 +286,25 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        # else:
+        #     if residual is None:
+        #         residual = hidden_states
+        #         hidden_states = self.input_layernorm(hidden_states)
+        #     else:
+        #         hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            
+        #     qkv, _ = self.qkv_proj(hidden_states)
+        #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        #     q, k = self.rotary_emb(positions, q, k)
+        #     attn_output = self.attn(q, k, v, forward_batch)
+        #     output, _ = self.o_proj(attn_output)
+        #     hidden_states=output
+            
+        #     hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        #     hidden_states = self.mlp(hidden_states)
+
+        
+        
         return hidden_states, residual
 
 
