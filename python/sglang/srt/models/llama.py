@@ -345,6 +345,9 @@ class LlamaModel(nn.Module):
             prefix="model.layers",
         )
 
+        if TP_OVERLAP:
+            self.tp_b0_handle=None
+            self.tp_b1_handle=None
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -359,6 +362,8 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
+        if torch.distributed.get_rank()==0:
+            print(hidden_states.shape)
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -367,6 +372,7 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
+           
         
         
         hidden_states, _ = self.norm(hidden_states, residual)
