@@ -55,7 +55,7 @@ from sglang.srt.distributed import tensor_model_parallel_all_reduce
 logger = logging.getLogger(__name__)
 
 
-TP_OVERLAP=True
+TP_OVERLAP=False
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -269,9 +269,12 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        h1=None,
+        p1=None,
+        res1=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        if not TP_OVERLAP:
+        if not TP_OVERLAP or h1 is None:
         
             # Self Attention
             if residual is None:
@@ -288,10 +291,12 @@ class LlamaDecoderLayer(nn.Module):
                 # Fully Connected
                 hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
                 hidden_states = self.mlp(hidden_states)
+                
+            return hidden_states, residual
+
         else:
             #TP_OVERLAP
             # Self Attention
-
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
@@ -299,25 +304,110 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
             
             #attn
-            qkv, _ = self.self_attn.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size], dim=-1)
-            
-            q, k = self.self_attn.rotary_emb(positions, q, k)
-            attn_output = self.self_attn.attn(q, k, v, forward_batch)
-            
-            
-            output, _ = self.self_attn.o_proj(attn_output)
-            output =tensor_model_parallel_all_reduce(output)
-            hidden_states=output
-            # Fully Connected
+            setattr(forward_batch.token_to_kv_pool,"cache_st",0)
+            setattr(forward_batch.token_to_kv_pool,"cache_en",hidden_states.shape[0])
 
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            # qkv, _ = self.self_attn.qkv_proj(hidden_states)
+            # q, k, v = qkv.split([self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size], dim=-1)
+
+            # q, k = self.self_attn.rotary_emb(positions, q, k)
+            # attn_output = self.self_attn.attn(q, k, v, forward_batch)
+            # output, _ = self.self_attn.o_proj(attn_output)
+            hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+            # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-            
             hidden_states = self.mlp(hidden_states)
             hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+            
+            h0_output=hidden_states
+            res0_output=residual
+            #
+            #----------------------------------------------------------
+            #----------------------------------------------------------
+            #----------------------------------------------------------
+            #----------------------------------------------------------
+            #----------------------------------------------------------
+            #----------------------------------------------------------
+            #----------------------------------------------------------
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            #----------------------------------------------------------
+
+            setattr(forward_batch.token_to_kv_pool,"cache_st",hidden_states.shape[0])
+            if(h1 is None or hidden_states is None):
+                b=0
+            tmp_en=hidden_states.shape[0]+h1.shape[0]
+            setattr(forward_batch.token_to_kv_pool,"cache_en",tmp_en)
+            hidden_states=h1
+            positions=p1
+            residual=res1
+            
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            
+            #attn
+      
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            # qkv, _ = self.self_attn.qkv_proj(hidden_states)
+            # q, k, v = qkv.split([self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size], dim=-1)
+
+            # q, k = self.self_attn.rotary_emb(positions, q, k)
+            # attn_output = self.self_attn.attn(q, k, v, forward_batch)
+            # output, _ = self.self_attn.o_proj(attn_output)
+            hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+            
+            h1_output=hidden_states
+            res1_output=residual
+            return h0_output,res0_output,h1_output,res1_output
         
-        
-        return hidden_states, residual
 
 
 class LlamaModel(nn.Module):
@@ -362,18 +452,38 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
-        if torch.distributed.get_rank()==0:
-            print(hidden_states.shape)
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
-           
+        # if torch.distributed.get_rank()==0:
+        # print(f"[{torch.distributed.get_rank()}]: {hidden_states.shape}")
+            
         
+        if hidden_states.shape[0]>1 and TP_OVERLAP:
+            h0, h1 = torch.chunk(hidden_states, 2, dim=0)  # 在dim=1（hidden_dim）上分成两份
+            p0, p1 =torch.chunk(hidden_states,2,dim=0)
+            res1=None
+            for i in range(len(self.layers)):
+                layer = self.layers[i]
+                h0, residual,h1,res1 = layer(
+                    p0,
+                    h0,
+                    forward_batch,
+                    residual,
+                    h1,
+                    p1,
+                    res1=res1
+                )
+            hidden_states=torch.cat([h0,h1],dim=0)
+            residual=torch.cat([residual,res1],dim=0)
+            
+        else:
+            for i in range(len(self.layers)):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
+           
         
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states

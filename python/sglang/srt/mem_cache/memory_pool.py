@@ -112,6 +112,8 @@ class KVCache(abc.ABC):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        st:int,
+        en:int,
     ) -> None:
         raise NotImplementedError()
 
@@ -348,9 +350,15 @@ class MHATokenToKVPool(KVCache):
             self.v_buffer[layer_id][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id][loc] = cache_k
-            self.v_buffer[layer_id][loc] = cache_v
-
+            if not hasattr(self, "cache_st"):
+                if cache_k.shape[0] != self.k_buffer[layer_id][loc].shape:
+                    b=0
+                self.k_buffer[layer_id][loc] = cache_k
+                self.v_buffer[layer_id][loc] = cache_v
+            else:
+                self.k_buffer[layer_id][loc][self.cache_st:self.cache_en] = cache_k
+                self.v_buffer[layer_id][loc][self.cache_st:self.cache_en] = cache_v
+                
 
 @torch.compile
 def fused_downcast(
