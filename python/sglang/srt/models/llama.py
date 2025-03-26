@@ -307,14 +307,14 @@ class LlamaDecoderLayer(nn.Module):
             
             
             output, _ = self.self_attn.o_proj(attn_output)
-            tensor_model_parallel_all_reduce(output)
+            output =tensor_model_parallel_all_reduce(output)
             hidden_states=output
             # Fully Connected
 
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             
             hidden_states = self.mlp(hidden_states)
-            tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states=tensor_model_parallel_all_reduce(hidden_states)
         
         
         return hidden_states, residual
