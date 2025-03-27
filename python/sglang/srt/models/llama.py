@@ -283,15 +283,15 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
-                hidden_states = self.self_attn(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
-                # Fully Connected
-                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-                hidden_states = self.mlp(hidden_states)
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
                 
             return hidden_states, residual
 
