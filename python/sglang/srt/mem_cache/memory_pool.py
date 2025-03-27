@@ -350,8 +350,9 @@ class MHATokenToKVPool(KVCache):
             self.v_buffer[layer_id][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            if not hasattr(self, "cache_st"):
-                if cache_k.shape[0] != self.k_buffer[layer_id][loc].shape:
+            # if not hasattr(self, "cache_st"):
+            if True:
+                if cache_k.shape[0] != self.k_buffer[layer_id][loc].shape[0]:
                     b=0
                 self.k_buffer[layer_id][loc] = cache_k
                 self.v_buffer[layer_id][loc] = cache_v

@@ -272,6 +272,7 @@ class LlamaDecoderLayer(nn.Module):
         h1=None,
         p1=None,
         res1=None,
+        fwd_batch1=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
         if not TP_OVERLAP or h1 is None:
@@ -297,15 +298,20 @@ class LlamaDecoderLayer(nn.Module):
         else:
             #TP_OVERLAP
             # Self Attention
+            # logger.info(f"!!!pp!!{hidden_states.shape}")
+            if hidden_states.shape[0]==0:
+                b=0
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
+                # logger.info(f"!!!qq!!{residual.shape}")
+
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
             
             #attn
-            setattr(forward_batch.token_to_kv_pool,"cache_st",0)
-            setattr(forward_batch.token_to_kv_pool,"cache_en",hidden_states.shape[0])
+            # setattr(forward_batch.token_to_kv_pool,"cache_st",0)
+            # setattr(forward_batch.token_to_kv_pool,"cache_en",hidden_states.shape[0])
 
             hidden_states = self.self_attn(
                 positions=positions,
@@ -370,11 +376,11 @@ class LlamaDecoderLayer(nn.Module):
 
             #----------------------------------------------------------
 
-            setattr(forward_batch.token_to_kv_pool,"cache_st",hidden_states.shape[0])
+            # setattr(forward_batch.token_to_kv_pool,"cache_st",hidden_states.shape[0])
             if(h1 is None or hidden_states is None):
                 b=0
             tmp_en=hidden_states.shape[0]+h1.shape[0]
-            setattr(forward_batch.token_to_kv_pool,"cache_en",tmp_en)
+            # setattr(forward_batch.token_to_kv_pool,"cache_en",tmp_en)
             hidden_states=h1
             positions=p1
             residual=res1
@@ -390,7 +396,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
-                forward_batch=forward_batch,
+                forward_batch=fwd_batch1,
             )
             # qkv, _ = self.self_attn.qkv_proj(hidden_states)
             # q, k, v = qkv.split([self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size], dim=-1)
@@ -454,22 +460,86 @@ class LlamaModel(nn.Module):
         residual = None
         # if torch.distributed.get_rank()==0:
         # print(f"[{torch.distributed.get_rank()}]: {hidden_states.shape}")
-            
         
-        if hidden_states.shape[0]>1 and TP_OVERLAP:
-            h0, h1 = torch.chunk(hidden_states, 2, dim=0)  # 在dim=1（hidden_dim）上分成两份
-            p0, p1 =torch.chunk(hidden_states,2,dim=0)
+        
+        if forward_batch.batch_size>1 and TP_OVERLAP:
+            b=0
+            from copy import deepcopy,copy
+            sub_fwd_batch0=copy(forward_batch)
+            sub_fwd_batch1=copy(forward_batch)
+            def balance_blance_devive_in_two_batch(fwd_batch):
+                accumulator=0
+                split_index=0
+                if fwd_batch.forward_mode.is_extend():
+                    overall_sum = sum(fwd_batch.extend_seq_lens)
+                    split_index = 0
+                    for value in fwd_batch.extend_seq_lens[:-1]:
+                        accumulator += value
+                        split_index += 1
+                        if accumulator >= overall_sum // 2:
+                            break
+                    b=0
+            
+                elif fwd_batch.forward_mode.is_decode():
+                    b=0
+                    accumulator = forward_batch.batch_size // 2
+                    # num_seqs = num_tokens
+                else:
+                    assert False
+                for key in [
+                "req_pool_indices",
+                "seq_lens",
+                "decode_seq_lens_cpu",
+                "extend_seq_lens",
+                "extend_prefix_lens",
+                "extend_start_loc",
+                "extend_prefix_lens_cpu",
+                "extend_seq_lens_cpu",
+                "extend_logprob_start_lens_cpu",
+                "positions"]:
+                    if getattr(fwd_batch, key) is not None:
+                        #skip for decode mode
+                        setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:split_index])
+                        setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[split_index:])
+
+                if not fwd_batch.forward_mode.is_decode() and getattr(fwd_batch, "extend_num_tokens") is not None:
+                    setattr(sub_fwd_batch0, "extend_num_tokens",accumulator)
+                    c=getattr(fwd_batch, "extend_num_tokens")
+                    setattr(sub_fwd_batch1, "extend_num_tokens",getattr(fwd_batch, "extend_num_tokens")-accumulator)
+                
+                for key in [
+                    "input_ids",
+                    "positions",
+                    "out_cache_loc",
+                ]:
+                    setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:accumulator])
+                    setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[accumulator:])
+
+                
+                return accumulator, sub_fwd_batch0, sub_fwd_batch1
+            #0, accumulator
+            #accumulator, sum(fwd_batch.extend_seq_lens)
+            # balance_blance_devive_in_two_batch(forward_batch)
+            accumulator, sub_fwd_batch0, sub_fwd_batch1=balance_blance_devive_in_two_batch(forward_batch)
+            
+            h0=hidden_states[0:accumulator]
+            h1=hidden_states[accumulator:]
+            p0=positions[0:accumulator]
+            p1=positions[accumulator:]
+            # h0, h1 = torch.split(hidden_states, accumulator, dim=0)  # 在dim=1（hidden_dim）上分成两份
+            # p0, p1 = torch.split(positions, accumulator,dim=0)
             res1=None
             for i in range(len(self.layers)):
                 layer = self.layers[i]
                 h0, residual,h1,res1 = layer(
                     p0,
                     h0,
-                    forward_batch,
+                    sub_fwd_batch0,
                     residual,
                     h1,
                     p1,
-                    res1=res1
+                    res1=res1,
+                    fwd_batch1=sub_fwd_batch1
                 )
             hidden_states=torch.cat([h0,h1],dim=0)
             residual=torch.cat([residual,res1],dim=0)
