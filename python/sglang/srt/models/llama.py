@@ -55,7 +55,7 @@ from sglang.srt.distributed import tensor_model_parallel_all_reduce
 logger = logging.getLogger(__name__)
 
 
-TP_OVERLAP=False
+TP_OVERLAP=True
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -289,10 +289,15 @@ class LlamaDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
+            if TP_OVERLAP:
+                hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
-                
+            if TP_OVERLAP:
+                hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+
             return hidden_states, residual
 
         else:
