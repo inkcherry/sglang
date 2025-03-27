@@ -210,7 +210,9 @@ class LlamaAttention(nn.Module):
         
         
         return output
-
+from torch.distributed import ReduceOp
+ranks = list(range(8))
+group_ = torch.distributed.new_group(ranks=ranks)
 
 class LlamaDecoderLayer(nn.Module):
     def __init__(
@@ -274,7 +276,8 @@ class LlamaDecoderLayer(nn.Module):
         res1=None,
         fwd_batch1=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+
+        #TP_OVERLAP
         if not TP_OVERLAP or h1 is None:
         
             # Self Attention
@@ -291,19 +294,22 @@ class LlamaDecoderLayer(nn.Module):
 
             if TP_OVERLAP:
                 hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+                # torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
+
 
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
             if TP_OVERLAP:
                 hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+                # torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
+
 
             return hidden_states, residual
 
         else:
-            from srt.distributed.parallel_state import get_tp_group
-
-            #TP_OVERLAP
+            # from srt.distributed.parallel_state import get_tp_group
+        
             # Self Attention
             # logger.info(f"!!!pp!!{hidden_states.shape}")
             if hidden_states.shape[0]==0:
@@ -331,17 +337,18 @@ class LlamaDecoderLayer(nn.Module):
             # q, k = self.self_attn.rotary_emb(positions, q, k)
             # attn_output = self.self_attn.attn(q, k, v, forward_batch)
             # output, _ = self.self_attn.o_proj(attn_output)
-            torch.distributed.all_reduce(hidden_states, get_tp_group().device_group)
+            
+            # torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
 
-            # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states =tensor_model_parallel_all_reduce(hidden_states)
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
             
             
 
-            torch.distributed.all_reduce(hidden_states, get_tp_group().device_group)
-            # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+            # torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
+            hidden_states=tensor_model_parallel_all_reduce(hidden_states)
             
             h0_output=hidden_states
             res0_output=residual
@@ -417,16 +424,16 @@ class LlamaDecoderLayer(nn.Module):
             # q, k = self.self_attn.rotary_emb(positions, q, k)
             # attn_output = self.self_attn.attn(q, k, v, forward_batch)
             # output, _ = self.self_attn.o_proj(attn_output)
-            torch.distributed.all_reduce(hidden_states, get_tp_group().device_group)
+            # torch.distributed.all_reduce(hidden_states, op=ReduceOp.SUM,group=group_)
 
-            # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states =tensor_model_parallel_all_reduce(hidden_states)
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
             
-            torch.distributed.all_reduce(hidden_states, get_tp_group().device_group)
+            # torch.distributed.all_reduce(hidden_states, op=ReduceOp.SUM,group=group_)
 
-            # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states=tensor_model_parallel_all_reduce(hidden_states)
             
             h1_output=hidden_states
             res1_output=residual
