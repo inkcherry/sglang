@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 
 
 TP_OVERLAP=True
+ASYNC_OP=True
+
 tp_b0_handle=None
 tp_b1_handle=None
 class LlamaMLP(nn.Module):
@@ -277,7 +279,7 @@ class LlamaDecoderLayer(nn.Module):
         res1=None,
         fwd_batch1=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
+        global ASYNC_OP
         #TP_OVERLAP
         if not TP_OVERLAP or h1 is None:
         
@@ -325,7 +327,8 @@ class LlamaDecoderLayer(nn.Module):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
-                tp_b0_handle.wait()
+                if ASYNC_OP:
+                    tp_b0_handle.wait()
 
                 # logger.info(f"!!!qq!!{residual.shape}")
 
@@ -346,7 +349,7 @@ class LlamaDecoderLayer(nn.Module):
             # q, k = self.self_attn.rotary_emb(positions, q, k)
             # attn_output = self.self_attn.attn(q, k, v, forward_batch)
             # output, _ = self.self_attn.o_proj(attn_output)
-            tp_b0_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=True)
+            tp_b0_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=ASYNC_OP)
             
             
             ##!!! b1 norm~attn
@@ -360,7 +363,8 @@ class LlamaDecoderLayer(nn.Module):
                 residual1 = hidden_states1
                 hidden_states1 = self.input_layernorm(hidden_states1)
             else:
-                tp_b1_handle.wait()
+                if ASYNC_OP:
+                    tp_b1_handle.wait()
                 hidden_states1, residual1 = self.input_layernorm(hidden_states1, residual1)
             
             #attn
@@ -371,13 +375,14 @@ class LlamaDecoderLayer(nn.Module):
                 forward_batch=fwd_batch1,
             )
             
-            tp_b1_handle=torch.distributed.all_reduce(hidden_states1, op=ReduceOp.SUM,group=group_, async_op=True)
+            tp_b1_handle=torch.distributed.all_reduce(hidden_states1, op=ReduceOp.SUM,group=group_, async_op=ASYNC_OP)
 
             
             
             
             ##!!!b0mlp
-            tp_b0_handle.wait()
+            if ASYNC_OP:
+                tp_b0_handle.wait()
             
             # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
             # Fully Connected
@@ -386,17 +391,18 @@ class LlamaDecoderLayer(nn.Module):
             
             
 
-            tp_b1_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=True)
+            tp_b1_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=ASYNC_OP)
             # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
             
             ##!!!b1 mlp
-            tp_b1_handle.wait()
+            if ASYNC_OP:
+                tp_b1_handle.wait()
             # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
             # Fully Connected
             hidden_states1, residual1 = self.post_attention_layernorm(hidden_states1, residual1)
             hidden_states1 = self.mlp(hidden_states1)
             
-            tp_b1_handle=torch.distributed.all_reduce(hidden_states1, op=ReduceOp.SUM,group=group_,async_op=True)
+            tp_b1_handle=torch.distributed.all_reduce(hidden_states1, op=ReduceOp.SUM,group=group_,async_op=ASYNC_OP)
 
             
             
@@ -593,9 +599,10 @@ class LlamaModel(nn.Module):
                     fwd_batch1=sub_fwd_batch1
                 )
             
-            global tp_b0_handle,tp_b1_handle
-            tp_b0_handle.wait()
-            tp_b1_handle.wait()
+            global tp_b0_handle,tp_b1_handle, ASYNC_OP
+            if ASYNC_OP:
+                tp_b0_handle.wait()
+                tp_b1_handle.wait()
             hidden_states=torch.cat([h0,h1],dim=0)
             residual=torch.cat([residual,res1],dim=0)
       
