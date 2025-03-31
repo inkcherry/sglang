@@ -56,7 +56,8 @@ logger = logging.getLogger(__name__)
 
 
 TP_OVERLAP=True
-
+tp_b0_handle=None
+tp_b1_handle=None
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -293,31 +294,39 @@ class LlamaDecoderLayer(nn.Module):
             )
 
             if TP_OVERLAP:
-                hidden_states =tensor_model_parallel_all_reduce(hidden_states)
-                # torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
+                # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+                torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
 
 
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
             if TP_OVERLAP:
-                hidden_states=tensor_model_parallel_all_reduce(hidden_states)
-                # torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
+                # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+                torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
 
 
             return hidden_states, residual
 
         else:
+            global tp_b0_handle,tp_b1_handle
+
             # from srt.distributed.parallel_state import get_tp_group
         
             # Self Attention
             # logger.info(f"!!!pp!!{hidden_states.shape}")
+            
+            
+            
+            ##!!! b0 norm~attn
             if hidden_states.shape[0]==0:
                 b=0
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
+                tp_b0_handle.wait()
+
                 # logger.info(f"!!!qq!!{residual.shape}")
 
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
@@ -337,18 +346,59 @@ class LlamaDecoderLayer(nn.Module):
             # q, k = self.self_attn.rotary_emb(positions, q, k)
             # attn_output = self.self_attn.attn(q, k, v, forward_batch)
             # output, _ = self.self_attn.o_proj(attn_output)
+            tp_b0_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=True)
             
-            # torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
+            
+            ##!!! b1 norm~attn
 
-            hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+            #------------0
+            hidden_states1=h1
+            positions1=p1
+            residual1=res1
+            
+            if residual1 is None:
+                residual1 = hidden_states1
+                hidden_states1 = self.input_layernorm(hidden_states1)
+            else:
+                tp_b1_handle.wait()
+                hidden_states1, residual1 = self.input_layernorm(hidden_states1, residual1)
+            
+            #attn
+      
+            hidden_states1 = self.self_attn(
+                positions=positions1,
+                hidden_states=hidden_states1,
+                forward_batch=fwd_batch1,
+            )
+            
+            tp_b1_handle=torch.distributed.all_reduce(hidden_states1, op=ReduceOp.SUM,group=group_, async_op=True)
+
+            
+            
+            
+            ##!!!b0mlp
+            tp_b0_handle.wait()
+            
+            # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
             
             
 
-            # torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
-            hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+            tp_b1_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=True)
+            # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+            
+            ##!!!b1 mlp
+            tp_b1_handle.wait()
+            # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+            # Fully Connected
+            hidden_states1, residual1 = self.post_attention_layernorm(hidden_states1, residual1)
+            hidden_states1 = self.mlp(hidden_states1)
+            
+            tp_b1_handle=torch.distributed.all_reduce(hidden_states1, op=ReduceOp.SUM,group=group_,async_op=True)
+
+            
             
             h0_output=hidden_states
             res0_output=residual
@@ -397,46 +447,22 @@ class LlamaDecoderLayer(nn.Module):
             #----------------------------------------------------------
 
             # setattr(forward_batch.token_to_kv_pool,"cache_st",hidden_states.shape[0])
-            if(h1 is None or hidden_states is None):
-                b=0
-            tmp_en=hidden_states.shape[0]+h1.shape[0]
+            # if(h1 is None or hidden_states is None):
+            #     b=0
+            # tmp_en=hidden_states.shape[0]+h1.shape[0]
             # setattr(forward_batch.token_to_kv_pool,"cache_en",tmp_en)
-            hidden_states=h1
-            positions=p1
-            residual=res1
-            
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
-            
-            #attn
-      
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=fwd_batch1,
-            )
+          
             # qkv, _ = self.self_attn.qkv_proj(hidden_states)
             # q, k, v = qkv.split([self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size], dim=-1)
 
             # q, k = self.self_attn.rotary_emb(positions, q, k)
             # attn_output = self.self_attn.attn(q, k, v, forward_batch)
             # output, _ = self.self_attn.o_proj(attn_output)
-            # torch.distributed.all_reduce(hidden_states, op=ReduceOp.SUM,group=group_)
 
-            hidden_states =tensor_model_parallel_all_reduce(hidden_states)
-            # Fully Connected
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-            hidden_states = self.mlp(hidden_states)
+            # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
             
-            # torch.distributed.all_reduce(hidden_states, op=ReduceOp.SUM,group=group_)
-
-            hidden_states=tensor_model_parallel_all_reduce(hidden_states)
-            
-            h1_output=hidden_states
-            res1_output=residual
+            h1_output=hidden_states1
+            res1_output=residual1
             return h0_output,res0_output,h1_output,res1_output
         
 
@@ -466,9 +492,8 @@ class LlamaModel(nn.Module):
             prefix="model.layers",
         )
 
-        if TP_OVERLAP:
-            self.tp_b0_handle=None
-            self.tp_b1_handle=None
+        # if TP_OVERLAP:
+        
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -555,6 +580,7 @@ class LlamaModel(nn.Module):
             # p0, p1 = torch.split(positions, accumulator,dim=0)
             res1=None
             for i in range(len(self.layers)):
+                
                 layer = self.layers[i]
                 h0, residual,h1,res1 = layer(
                     p0,
@@ -566,8 +592,13 @@ class LlamaModel(nn.Module):
                     res1=res1,
                     fwd_batch1=sub_fwd_batch1
                 )
+            
+            global tp_b0_handle,tp_b1_handle
+            tp_b0_handle.wait()
+            tp_b1_handle.wait()
             hidden_states=torch.cat([h0,h1],dim=0)
             residual=torch.cat([residual,res1],dim=0)
+      
             
         else:
             for i in range(len(self.layers)):
@@ -578,8 +609,7 @@ class LlamaModel(nn.Module):
                     forward_batch,
                     residual,
                 )
-           
-        
+      
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
