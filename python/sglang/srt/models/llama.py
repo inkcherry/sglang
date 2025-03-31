@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 TP_OVERLAP=True
-ASYNC_OP=True
+ASYNC_OP=False
 
 tp_b0_handle=None
 tp_b1_handle=None
@@ -214,7 +214,7 @@ class LlamaAttention(nn.Module):
         
         return output
 from torch.distributed import ReduceOp
-ranks = list(range(8))
+ranks = list(range(2))
 group_ = torch.distributed.new_group(ranks=ranks)
 
 class LlamaDecoderLayer(nn.Module):
