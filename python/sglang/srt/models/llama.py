@@ -51,15 +51,17 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
 logger = logging.getLogger(__name__)
 
 
 TP_OVERLAP=True
 ASYNC_OP=False
-
 tp_b0_handle=None
 tp_b1_handle=None
+from torch.distributed import ReduceOp
+ranks = list(range(2))
+group_ = torch.distributed.new_group(ranks=ranks)
+
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -78,14 +80,6 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
-        #---
-        # self.down_proj = RowParallelLinearNoComm(
-        #     intermediate_size,
-        #     hidden_size,
-        #     bias=False,
-        #     quant_config=quant_config,
-        #     prefix=add_prefix("down_proj", prefix),
-        # )
         
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -94,9 +88,7 @@ class LlamaMLP(nn.Module):
             reduce_results=not TP_OVERLAP,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-        )
-        #-----------------
-        
+        )        
         
         if hidden_act != "silu":
             raise ValueError(
@@ -199,23 +191,14 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        
-        
-        
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
-        
-        
-        
-        
-        
+
         return output
-from torch.distributed import ReduceOp
-ranks = list(range(2))
-group_ = torch.distributed.new_group(ranks=ranks)
+
 
 class LlamaDecoderLayer(nn.Module):
     def __init__(
@@ -313,13 +296,6 @@ class LlamaDecoderLayer(nn.Module):
         else:
             global tp_b0_handle,tp_b1_handle
 
-            # from srt.distributed.parallel_state import get_tp_group
-        
-            # Self Attention
-            # logger.info(f"!!!pp!!{hidden_states.shape}")
-            
-            
-            
             ##!!! b0 norm~attn
             if hidden_states.shape[0]==0:
                 b=0
@@ -330,25 +306,17 @@ class LlamaDecoderLayer(nn.Module):
                 if ASYNC_OP:
                     tp_b0_handle.wait()
 
-                # logger.info(f"!!!qq!!{residual.shape}")
 
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
             
-            #attn
-            # setattr(forward_batch.token_to_kv_pool,"cache_st",0)
-            # setattr(forward_batch.token_to_kv_pool,"cache_en",hidden_states.shape[0])
+         
 
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            # qkv, _ = self.self_attn.qkv_proj(hidden_states)
-            # q, k, v = qkv.split([self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size], dim=-1)
-
-            # q, k = self.self_attn.rotary_emb(positions, q, k)
-            # attn_output = self.self_attn.attn(q, k, v, forward_batch)
-            # output, _ = self.self_attn.o_proj(attn_output)
+          
             tp_b0_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=ASYNC_OP)
             
             
@@ -389,7 +357,6 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
             
-            
 
             tp_b1_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=ASYNC_OP)
             # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
@@ -408,65 +375,7 @@ class LlamaDecoderLayer(nn.Module):
             
             h0_output=hidden_states
             res0_output=residual
-            #
-            #----------------------------------------------------------
-            #----------------------------------------------------------
-            #----------------------------------------------------------
-            #----------------------------------------------------------
-            #----------------------------------------------------------
-            #----------------------------------------------------------
-            #----------------------------------------------------------
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            #----------------------------------------------------------
-
-            # setattr(forward_batch.token_to_kv_pool,"cache_st",hidden_states.shape[0])
-            # if(h1 is None or hidden_states is None):
-            #     b=0
-            # tmp_en=hidden_states.shape[0]+h1.shape[0]
-            # setattr(forward_batch.token_to_kv_pool,"cache_en",tmp_en)
-          
-            # qkv, _ = self.self_attn.qkv_proj(hidden_states)
-            # q, k, v = qkv.split([self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size], dim=-1)
-
-            # q, k = self.self_attn.rotary_emb(positions, q, k)
-            # attn_output = self.self_attn.attn(q, k, v, forward_batch)
-            # output, _ = self.self_attn.o_proj(attn_output)
-
-            # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
-            
+        
             h1_output=hidden_states1
             res1_output=residual1
             return h0_output,res0_output,h1_output,res1_output
