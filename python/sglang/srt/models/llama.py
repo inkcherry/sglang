@@ -62,6 +62,7 @@ from torch.distributed import ReduceOp
 ranks = list(range(2))
 group_ = torch.distributed.new_group(ranks=ranks)
 
+
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -72,7 +73,6 @@ class LlamaMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        #-------
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -80,7 +80,6 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
-        
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -89,7 +88,6 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )        
-        
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -155,9 +153,6 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        
-        #------
-        #nocomm
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -166,7 +161,6 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        #-----------
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -282,7 +276,6 @@ class LlamaDecoderLayer(nn.Module):
                 # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
                 torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
 
-
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
@@ -290,9 +283,7 @@ class LlamaDecoderLayer(nn.Module):
                 # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
                 torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_)
 
-
             return hidden_states, residual
-
         else:
             global tp_b0_handle,tp_b1_handle
 
@@ -305,20 +296,14 @@ class LlamaDecoderLayer(nn.Module):
             else:
                 if ASYNC_OP:
                     tp_b0_handle.wait()
-
-
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
             
-         
-
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-          
             tp_b0_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=ASYNC_OP)
-            
             
             ##!!! b1 norm~attn
 
@@ -345,9 +330,6 @@ class LlamaDecoderLayer(nn.Module):
             
             tp_b1_handle=torch.distributed.all_reduce(hidden_states1, op=ReduceOp.SUM,group=group_, async_op=ASYNC_OP)
 
-            
-            
-            
             ##!!!b0mlp
             if ASYNC_OP:
                 tp_b0_handle.wait()
@@ -356,7 +338,6 @@ class LlamaDecoderLayer(nn.Module):
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
-            
 
             tp_b1_handle=torch.distributed.all_reduce(hidden_states,op=ReduceOp.SUM,group=group_, async_op=ASYNC_OP)
             # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
@@ -370,9 +351,6 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states1 = self.mlp(hidden_states1)
             
             tp_b1_handle=torch.distributed.all_reduce(hidden_states1, op=ReduceOp.SUM,group=group_,async_op=ASYNC_OP)
-
-            
-            
             h0_output=hidden_states
             res0_output=residual
         

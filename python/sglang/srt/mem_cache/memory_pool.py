@@ -350,7 +350,7 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
-                
+
 
 @torch.compile
 def fused_downcast(
