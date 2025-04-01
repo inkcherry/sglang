@@ -422,7 +422,7 @@ class LlamaDecoderLayer(nn.Module):
             )
             hidden_states = self.mlp(hidden_states)
 
-            tp_b1_handle = torch.distributed.all_reduce(
+            tp_b0_handle = torch.distributed.all_reduce(
                 hidden_states, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
             )
             # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
