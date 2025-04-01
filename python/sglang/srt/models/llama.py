@@ -69,7 +69,7 @@ ranks = list(range(2))
 group_ = torch.distributed.new_group(ranks=ranks)
 from copy import deepcopy,copy
 
-def balance_blance_devive_in_two_batch(fwd_batch):
+def token_balanced_batch_split(fwd_batch):
     sub_fwd_batch0=copy(fwd_batch)
     sub_fwd_batch1=copy(fwd_batch)
     bs_joint_batch_boundary=0
@@ -466,8 +466,8 @@ class LlamaModel(nn.Module):
            
             #0, bs_joint_batch_boundary
             #bs_joint_batch_boundary, sum(fwd_batch.extend_seq_lens)
-            # balance_blance_devive_in_two_batch(forward_batch)
-            bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1=balance_blance_devive_in_two_batch(forward_batch)
+            # token_balanced_batch_split(forward_batch)
+            bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1=token_balanced_batch_split(forward_batch)
             
             h0=hidden_states[0:bs_joint_batch_boundary]
             h1=hidden_states[bs_joint_batch_boundary:]
