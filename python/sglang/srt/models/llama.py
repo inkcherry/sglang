@@ -53,14 +53,73 @@ from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
-
+### WA: Temporary workaround code
 TP_OVERLAP=True
-ASYNC_OP=False
+
+#for debug
+# ASYNC_OP=False
+ASYNC_OP=TP_OVERLAP
+
+
+
 tp_b0_handle=None
 tp_b1_handle=None
 from torch.distributed import ReduceOp
 ranks = list(range(2))
 group_ = torch.distributed.new_group(ranks=ranks)
+from copy import deepcopy,copy
+
+def balance_blance_devive_in_two_batch(fwd_batch):
+    sub_fwd_batch0=copy(fwd_batch)
+    sub_fwd_batch1=copy(fwd_batch)
+    bs_joint_batch_boundary=0
+    batch_boundary=0
+    if fwd_batch.forward_mode.is_extend():
+        overall_sum = sum(fwd_batch.extend_seq_lens)
+        batch_boundary = 0
+        for value in fwd_batch.extend_seq_lens[:-1]:
+            bs_joint_batch_boundary += value
+            batch_boundary += 1
+            if bs_joint_batch_boundary >= overall_sum // 2:
+                break
+
+    elif fwd_batch.forward_mode.is_decode():
+        bs_joint_batch_boundary = fwd_batch.batch_size // 2
+        # num_seqs = num_tokens
+    else:
+        assert False
+    for key in [
+    "req_pool_indices",
+    "seq_lens",
+    "decode_seq_lens_cpu",
+    "extend_seq_lens",
+    "extend_prefix_lens",
+    "extend_start_loc",
+    "extend_prefix_lens_cpu",
+    "extend_seq_lens_cpu",
+    "extend_logprob_start_lens_cpu",
+    "positions"]:
+        if getattr(fwd_batch, key) is not None:
+            #skip for decode mode
+            setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:batch_boundary])
+            setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[batch_boundary:])
+
+    if not fwd_batch.forward_mode.is_decode() and getattr(fwd_batch, "extend_num_tokens") is not None:
+        setattr(sub_fwd_batch0, "extend_num_tokens",bs_joint_batch_boundary)
+        c=getattr(fwd_batch, "extend_num_tokens")
+        setattr(sub_fwd_batch1, "extend_num_tokens",getattr(fwd_batch, "extend_num_tokens")-bs_joint_batch_boundary)
+    
+    for key in [
+        "input_ids",
+        "positions",
+        "out_cache_loc",
+    ]:
+        setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:bs_joint_batch_boundary])
+        setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[bs_joint_batch_boundary:])
+
+    
+    return bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1
+### WA: Temporary workaround code
 
 
 class LlamaMLP(nn.Module):
@@ -401,76 +460,20 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
-        # if torch.distributed.get_rank()==0:
-        # print(f"[{torch.distributed.get_rank()}]: {hidden_states.shape}")
         
         
         if forward_batch.batch_size>1 and TP_OVERLAP:
-            b=0
-            from copy import deepcopy,copy
-            sub_fwd_batch0=copy(forward_batch)
-            sub_fwd_batch1=copy(forward_batch)
-            def balance_blance_devive_in_two_batch(fwd_batch):
-                accumulator=0
-                split_index=0
-                if fwd_batch.forward_mode.is_extend():
-                    overall_sum = sum(fwd_batch.extend_seq_lens)
-                    split_index = 0
-                    for value in fwd_batch.extend_seq_lens[:-1]:
-                        accumulator += value
-                        split_index += 1
-                        if accumulator >= overall_sum // 2:
-                            break
-                    b=0
-            
-                elif fwd_batch.forward_mode.is_decode():
-                    b=0
-                    accumulator = forward_batch.batch_size // 2
-                    # num_seqs = num_tokens
-                else:
-                    assert False
-                for key in [
-                "req_pool_indices",
-                "seq_lens",
-                "decode_seq_lens_cpu",
-                "extend_seq_lens",
-                "extend_prefix_lens",
-                "extend_start_loc",
-                "extend_prefix_lens_cpu",
-                "extend_seq_lens_cpu",
-                "extend_logprob_start_lens_cpu",
-                "positions"]:
-                    if getattr(fwd_batch, key) is not None:
-                        #skip for decode mode
-                        setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:split_index])
-                        setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[split_index:])
-
-                if not fwd_batch.forward_mode.is_decode() and getattr(fwd_batch, "extend_num_tokens") is not None:
-                    setattr(sub_fwd_batch0, "extend_num_tokens",accumulator)
-                    c=getattr(fwd_batch, "extend_num_tokens")
-                    setattr(sub_fwd_batch1, "extend_num_tokens",getattr(fwd_batch, "extend_num_tokens")-accumulator)
-                
-                for key in [
-                    "input_ids",
-                    "positions",
-                    "out_cache_loc",
-                ]:
-                    setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:accumulator])
-                    setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[accumulator:])
-
-                
-                return accumulator, sub_fwd_batch0, sub_fwd_batch1
-            #0, accumulator
-            #accumulator, sum(fwd_batch.extend_seq_lens)
+           
+            #0, bs_joint_batch_boundary
+            #bs_joint_batch_boundary, sum(fwd_batch.extend_seq_lens)
             # balance_blance_devive_in_two_batch(forward_batch)
-            accumulator, sub_fwd_batch0, sub_fwd_batch1=balance_blance_devive_in_two_batch(forward_batch)
+            bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1=balance_blance_devive_in_two_batch(forward_batch)
             
-            h0=hidden_states[0:accumulator]
-            h1=hidden_states[accumulator:]
-            p0=positions[0:accumulator]
-            p1=positions[accumulator:]
-            # h0, h1 = torch.split(hidden_states, accumulator, dim=0)  # 在dim=1（hidden_dim）上分成两份
-            # p0, p1 = torch.split(positions, accumulator,dim=0)
+            h0=hidden_states[0:bs_joint_batch_boundary]
+            h1=hidden_states[bs_joint_batch_boundary:]
+            p0=positions[0:bs_joint_batch_boundary]
+            p1=positions[bs_joint_batch_boundary:]
+
             res1=None
             for i in range(len(self.layers)):
                 
