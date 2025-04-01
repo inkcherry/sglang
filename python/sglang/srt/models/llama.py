@@ -55,8 +55,10 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 ### WA: Temporary workaround code
-TP_OVERLAP = True
+#################################
+#################################
 
+TP_OVERLAP = True
 # for debug
 # ASYNC_OP=False
 ASYNC_OP = TP_OVERLAP
@@ -87,7 +89,6 @@ def token_balanced_batch_split(fwd_batch):
 
     elif fwd_batch.forward_mode.is_decode():
         bs_joint_batch_boundary = fwd_batch.batch_size // 2
-        # num_seqs = num_tokens
     else:
         assert False
     for key in [
@@ -112,7 +113,6 @@ def token_balanced_batch_split(fwd_batch):
         and getattr(fwd_batch, "extend_num_tokens") is not None
     ):
         setattr(sub_fwd_batch0, "extend_num_tokens", bs_joint_batch_boundary)
-        c = getattr(fwd_batch, "extend_num_tokens")
         setattr(
             sub_fwd_batch1,
             "extend_num_tokens",
@@ -129,8 +129,10 @@ def token_balanced_batch_split(fwd_batch):
 
     return bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1
 
-
 ### WA: Temporary workaround code
+#################################
+#################################
+
 
 
 class LlamaMLP(nn.Module):
@@ -327,7 +329,6 @@ class LlamaDecoderLayer(nn.Module):
         fwd_batch1=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         global ASYNC_OP
-        # TP_OVERLAP
         if not TP_OVERLAP or h1 is None:
 
             # Self Attention
@@ -364,8 +365,6 @@ class LlamaDecoderLayer(nn.Module):
             global tp_b0_handle, tp_b1_handle
 
             ##!!! b0 norm~attn
-            if hidden_states.shape[0] == 0:
-                b = 0
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
@@ -493,9 +492,6 @@ class LlamaModel(nn.Module):
 
         if forward_batch.batch_size > 1 and TP_OVERLAP:
 
-            # 0, bs_joint_batch_boundary
-            # bs_joint_batch_boundary, sum(fwd_batch.extend_seq_lens)
-            # token_balanced_batch_split(forward_batch)
             bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1 = (
                 token_balanced_batch_split(forward_batch)
             )
