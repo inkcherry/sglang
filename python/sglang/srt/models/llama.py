@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 TP_OVERLAP = True
 # for debug
 # ASYNC_OP=False
-ASYNC_OP = TP_OVERLAP
+ASYNC_OP = True
 
 
 tp_b0_handle = None
@@ -106,7 +106,7 @@ def token_balanced_batch_split(fwd_batch):
         "extend_logprob_start_lens_cpu",
         "positions",
     ]:
-        if getattr(fwd_batch, key) is not None:
+        if hasattr(fwd_batch,key) and getattr(fwd_batch, key) is not None:
             # skip for decode mode
             setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:batch_boundary])
             setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[batch_boundary:])
@@ -149,6 +149,9 @@ class LlamaMLP(nn.Module):
         reduce_results: bool = True,
     ) -> None:
         super().__init__()
+        if reduce_results:
+            reduce_results=not TP_OVERLAP
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -160,7 +163,6 @@ class LlamaMLP(nn.Module):
             intermediate_size,
             hidden_size,
             bias=False,
-            reduce_results=not TP_OVERLAP,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
@@ -481,6 +483,7 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
+        aux_hidden_states=[]
 
         if forward_batch.batch_size > 1 and TP_OVERLAP:
 
