@@ -91,6 +91,7 @@ def token_balanced_batch_split(fwd_batch):
                 break
 
     elif fwd_batch.forward_mode.is_decode():
+        batch_boundary=fwd_batch.batch_size // 2
         bs_joint_batch_boundary = fwd_batch.batch_size // 2
     else:
         assert False
@@ -130,6 +131,8 @@ def token_balanced_batch_split(fwd_batch):
         setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:bs_joint_batch_boundary])
         setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[bs_joint_batch_boundary:])
 
+    sub_fwd_batch0.batch_size=batch_boundary
+    sub_fwd_batch1.batch_size=fwd_batch.batch_size-sub_fwd_batch0.batch_size
     return bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1
 
 ### WA: Temporary workaround code
@@ -337,8 +340,9 @@ class LlamaDecoderLayer(nn.Module):
         residual1: Optional[torch.Tensor] = None,
         fwd_batch1: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        
         if not TP_OVERLAP or hidden_states1 is None:
-
             # Self Attention
             if residual is None:
                 residual = hidden_states
@@ -371,7 +375,7 @@ class LlamaDecoderLayer(nn.Module):
             return hidden_states, residual
         else:
             global tp_b0_handle, tp_b1_handle
-            ### u-batch0 norm~attn
+            ### u-batch0 norm~attn   tpo norm~attn
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
@@ -487,15 +491,25 @@ class LlamaModel(nn.Module):
 
         if forward_batch.batch_size > 1 and TP_OVERLAP:
 
-            bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1 = (
-                token_balanced_batch_split(forward_batch)
-            )
-
-            hidden_states0 = hidden_states[0:bs_joint_batch_boundary]
-            hidden_states1 = hidden_states[bs_joint_batch_boundary:]
-            positions0 = positions[0:bs_joint_batch_boundary]
-            positions1 = positions[bs_joint_batch_boundary:]
+            
+            from sglang.srt.two_batch_overlap import compute_split_seq_index
+            split_seq_index = compute_split_seq_index(forward_batch.forward_mode, forward_batch.batch_size, forward_batch.extend_seq_lens)
+            forward_batch.tbo_split_seq_index=split_seq_index
+            forward_batch.prepare_tbo()
+            child_batch0=forward_batch.tbo_children[0]
+            child_batch1=forward_batch.tbo_children[1]
+            # bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1 = (
+            #     token_balanced_batch_split(forward_batch)
+            # )
+            sub_fwd_batch0=child_batch0
+            sub_fwd_batch1=child_batch1
+            hidden_states0 = hidden_states[slice(*child_batch0.tbo_parent_token_range)]
+            hidden_states1 = hidden_states[slice(*child_batch1.tbo_parent_token_range)]
+            positions0 = positions[slice(*child_batch0.tbo_parent_token_range)]
+            positions1 = positions[slice(*child_batch1.tbo_parent_token_range)]
             residual1 = None
+            
+            
             for i in range(len(self.layers)):
                 if i in self.layers_to_capture:
                     raise NotImplementedError("EAGLE 3 does not yet support cross-layer overlap.")

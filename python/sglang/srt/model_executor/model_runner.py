@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -151,6 +151,7 @@ class ModelRunner:
                 "torchao_config": server_args.torchao_config,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "deepep_mode": server_args.deepep_mode,
@@ -834,6 +835,17 @@ class ModelRunner:
         return c
 
     def init_attention_backend(self):
+        
+        
+        if self.server_args.enable_two_batch_overlap:
+            self.attn_backend = TboAttnBackend(
+                primary=self._create_attention_backend_core(),
+                children=[self._create_attention_backend_core() for _ in range(2)],
+            )
+        else:
+            self.attn_backend = self._create_attention_backend_core()
+            
+    def _create_attention_backend_core(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
             if not self.use_mla_backend:
@@ -844,13 +856,13 @@ class ModelRunner:
                 # Init streams
                 if self.server_args.speculative_algorithm == "EAGLE":
                     self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                self.attn_backend = FlashInferAttnBackend(self)
+                return  FlashInferAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
                     FlashInferMLAAttnBackend,
                 )
 
-                self.attn_backend = FlashInferMLAAttnBackend(self)
+                return  FlashInferMLAAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
@@ -865,7 +877,7 @@ class ModelRunner:
                     DoubleSparseAttnBackend,
                 )
 
-                self.attn_backend = DoubleSparseAttnBackend(self)
+                return  DoubleSparseAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
@@ -875,11 +887,11 @@ class ModelRunner:
                 TorchNativeAttnBackend,
             )
 
-            self.attn_backend = TorchNativeAttnBackend(self)
+            return TorchNativeAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
-            self.attn_backend = FlashMLABackend(self)
+            return FlashMLABackend(self)
         elif self.server_args.attention_backend == "fa3":
             assert torch.cuda.get_device_capability()[0] >= 9, (
                 "FlashAttention v3 Backend requires SM>=90. "
@@ -892,7 +904,7 @@ class ModelRunner:
                 FlashAttentionBackend,
             )
 
-            self.attn_backend = FlashAttentionBackend(self)
+            return FlashAttentionBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"

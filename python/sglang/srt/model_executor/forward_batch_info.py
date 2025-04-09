@@ -550,10 +550,11 @@ class ForwardBatch:
         ]:
             output_dict[key] = getattr(self, key)
 
-        assert (
-            _compute_extend_num_tokens(self.input_ids, self.forward_mode)
-            == self.extend_num_tokens
-        ), f"{self=}"
+        if self.extend_num_tokens is not None:
+            assert (
+                _compute_extend_num_tokens(self.input_ids, self.forward_mode)
+                == self.extend_num_tokens
+            ), f"{self=}"
         extend_num_tokens = _compute_extend_num_tokens(
             output_dict["input_ids"], output_dict["forward_mode"]
         )
