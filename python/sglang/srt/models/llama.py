@@ -49,6 +49,8 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt import two_batch_overlap
+
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -61,7 +63,7 @@ logger = logging.getLogger(__name__)
 TP_OVERLAP = True
 # for debug
 # ASYNC_OP=False
-ASYNC_OP = True
+ASYNC_OP = False
 
 
 tp_b0_handle = None
@@ -287,6 +289,7 @@ class LlamaDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id=layer_id
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -329,6 +332,83 @@ class LlamaDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    
+    
+    ##tbo related
+    def _forward_tbo_op_input_layernorm(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: int,
+    ):
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+                )
+            )
+        global tp_b0_handle, tp_b1_handle
+        ### u-batch0 norm~attn   tpo norm~attn
+
+        if residual is None:
+            state.residual_after_input_ln = hidden_states
+            state.hidden_states_after_input_ln = self.input_layernorm(hidden_states)
+        else:
+            if ASYNC_OP:
+                tp_b0_handle.wait()
+            state.hidden_states_after_input_ln, state.residual_after_input_ln = self.input_layernorm(hidden_states, residual)
+    
+    def _forward_tbo_op_attn(self, state):
+        state.hidden_states_after_attn = self.self_attn(
+            positions=state.positions,
+            hidden_states=state.hidden_states_after_input_ln,
+            forward_batch=state.forward_batch,
+        )
+        tp_b0_handle = torch.distributed.all_reduce(
+            state.hidden_states_after_input_ln, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
+        )
+    def _forward_tbo_op_mlp(self, state):
+         # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+        state.hidden_states_after_post_ln, state.residual_after_post_attn_ln = self.post_attention_layernorm(
+            state.hidden_states_after_attn, state.residual_after_input_ln
+        )
+        state.hidden_states_after_mlp = self.mlp(state.hidden_states_after_post_ln)
+
+        tp_b0_handle = torch.distributed.all_reduce(
+           state.hidden_states_after_mlp, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
+        )
+        
+        output = dict(
+            positions=state.positions,
+            hidden_states=state.hidden_states_after_mlp,
+            forward_batch=state.forward_batch,
+            residual=state.residual_after_post_attn_ln,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear()
+        return output
+
+    def get_forward_tbo_operations(
+        self, forward_mode, tbo_child_index: int
+    ):  
+
+        operations = [
+        self._forward_tbo_op_input_layernorm,
+        self._forward_tbo_op_attn,
+        self._forward_tbo_op_mlp
+        ]
+        return two_batch_overlap.decorate_operations(
+            operations, debug_name_prefix=f"L{self.layer_id}-"
+        )
+        
+
+   
+    ##tbo related
+    
     def forward(
         self,
         positions: torch.Tensor,
@@ -340,6 +420,9 @@ class LlamaDecoderLayer(nn.Module):
         residual1: Optional[torch.Tensor] = None,
         fwd_batch1: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        
+        
         
         
         if not TP_OVERLAP or hidden_states1 is None:
@@ -475,6 +558,38 @@ class LlamaModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
 
+    def _forward_tbo_layers(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        start_layer: int,
+    ):  
+        
+        end_layer = len(self.layers)
+        if start_layer == end_layer:
+            return hidden_states, residual
+        def compute_operations(tbo_child_index: str):
+            return [
+                op
+                for i in range(start_layer, end_layer)
+                for op in self.layers[i].get_forward_tbo_operations(
+                    forward_batch.forward_mode, tbo_child_index
+                )
+            ]
+        return two_batch_overlap.model_forward_execute_two_batch(
+            inputs=dict(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+            ),
+            operations_a=compute_operations(0),
+            operations_b=compute_operations(1),
+            delta_stages=0
+        )
+        
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -488,7 +603,7 @@ class LlamaModel(nn.Module):
             hidden_states = input_embeds
         residual = None
         aux_hidden_states=[]
-
+        
         if forward_batch.batch_size > 1 and TP_OVERLAP:
 
             
@@ -496,40 +611,59 @@ class LlamaModel(nn.Module):
             split_seq_index = compute_split_seq_index(forward_batch.forward_mode, forward_batch.batch_size, forward_batch.extend_seq_lens)
             forward_batch.tbo_split_seq_index=split_seq_index
             forward_batch.prepare_tbo()
-            child_batch0=forward_batch.tbo_children[0]
-            child_batch1=forward_batch.tbo_children[1]
-            # bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1 = (
-            #     token_balanced_batch_split(forward_batch)
-            # )
-            sub_fwd_batch0=child_batch0
-            sub_fwd_batch1=child_batch1
-            hidden_states0 = hidden_states[slice(*child_batch0.tbo_parent_token_range)]
-            hidden_states1 = hidden_states[slice(*child_batch1.tbo_parent_token_range)]
-            positions0 = positions[slice(*child_batch0.tbo_parent_token_range)]
-            positions1 = positions[slice(*child_batch1.tbo_parent_token_range)]
-            residual1 = None
+    
+            hidden_states, residual = self._forward_tbo_layers(
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+                start_layer=0,
+            )
+         
+            
+        
+        
+        # if forward_batch.batch_size > 1 and TP_OVERLAP:
+
+            
+        #     from sglang.srt.two_batch_overlap import compute_split_seq_index
+        #     split_seq_index = compute_split_seq_index(forward_batch.forward_mode, forward_batch.batch_size, forward_batch.extend_seq_lens)
+        #     forward_batch.tbo_split_seq_index=split_seq_index
+        #     forward_batch.prepare_tbo()
+        #     child_batch0=forward_batch.tbo_children[0]
+        #     child_batch1=forward_batch.tbo_children[1]
+        #     # bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1 = (
+        #     #     token_balanced_batch_split(forward_batch)
+        #     # )
+        #     sub_fwd_batch0=child_batch0
+        #     sub_fwd_batch1=child_batch1
+        #     hidden_states0 = hidden_states[slice(*child_batch0.tbo_parent_token_range)]
+        #     hidden_states1 = hidden_states[slice(*child_batch1.tbo_parent_token_range)]
+        #     positions0 = positions[slice(*child_batch0.tbo_parent_token_range)]
+        #     positions1 = positions[slice(*child_batch1.tbo_parent_token_range)]
+        #     residual1 = None
             
             
-            for i in range(len(self.layers)):
-                if i in self.layers_to_capture:
-                    raise NotImplementedError("EAGLE 3 does not yet support cross-layer overlap.")
-                layer = self.layers[i]
-                hidden_states0, residual, hidden_states1, residual1 = layer(
-                    positions0,
-                    hidden_states0,
-                    sub_fwd_batch0,
-                    residual,
-                    hidden_states1,
-                    positions1,
-                    residual1,
-                    sub_fwd_batch1,
-                )
-            global tp_b0_handle, tp_b1_handle
-            if ASYNC_OP:
-                tp_b0_handle.wait()
-                tp_b1_handle.wait()
-            hidden_states = torch.cat([hidden_states0, hidden_states1], dim=0)
-            residual = torch.cat([residual, residual1], dim=0)
+        #     for i in range(len(self.layers)):
+        #         if i in self.layers_to_capture:
+        #             raise NotImplementedError("EAGLE 3 does not yet support cross-layer overlap.")
+        #         layer = self.layers[i]
+        #         hidden_states0, residual, hidden_states1, residual1 = layer(
+        #             positions0,
+        #             hidden_states0,
+        #             sub_fwd_batch0,
+        #             residual,
+        #             hidden_states1,
+        #             positions1,
+        #             residual1,
+        #             sub_fwd_batch1,
+        #         )
+        #     global tp_b0_handle, tp_b1_handle
+        #     if ASYNC_OP:
+        #         tp_b0_handle.wait()
+        #         tp_b1_handle.wait()
+        #     hidden_states = torch.cat([hidden_states0, hidden_states1], dim=0)
+        #     residual = torch.cat([residual, residual1], dim=0)
 
         else:
             for i in range(len(self.layers)):
