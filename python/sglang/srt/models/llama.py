@@ -80,66 +80,6 @@ ranks = list(range(2))
 group_ = torch.distributed.new_group(ranks=ranks)
 from copy import copy, deepcopy
 
-
-def token_balanced_batch_split(fwd_batch):
-    sub_fwd_batch0 = copy(fwd_batch)
-    sub_fwd_batch1 = copy(fwd_batch)
-    bs_joint_batch_boundary = 0
-    batch_boundary = 0
-    if fwd_batch.forward_mode.is_extend():
-        all_tokens = sum(fwd_batch.extend_seq_lens)
-        batch_boundary = 0
-        for batch_tokens in fwd_batch.extend_seq_lens[:-1]:
-            bs_joint_batch_boundary += batch_tokens
-            batch_boundary += 1
-            if bs_joint_batch_boundary >= all_tokens // 2:
-                break
-
-    elif fwd_batch.forward_mode.is_decode():
-        batch_boundary=fwd_batch.batch_size // 2
-        bs_joint_batch_boundary = fwd_batch.batch_size // 2
-    else:
-        assert False
-    for key in [
-        "req_pool_indices",
-        "seq_lens",
-        "decode_seq_lens_cpu",
-        "extend_seq_lens",
-        "extend_prefix_lens",
-        "extend_start_loc",
-        "extend_prefix_lens_cpu",
-        "extend_seq_lens_cpu",
-        "extend_logprob_start_lens_cpu",
-        "positions",
-    ]:
-        if hasattr(fwd_batch,key) and getattr(fwd_batch, key) is not None:
-            # skip for decode mode
-            setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:batch_boundary])
-            setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[batch_boundary:])
-
-    if (
-        not fwd_batch.forward_mode.is_decode()
-        and getattr(fwd_batch, "extend_num_tokens") is not None
-    ):
-        setattr(sub_fwd_batch0, "extend_num_tokens", bs_joint_batch_boundary)
-        setattr(
-            sub_fwd_batch1,
-            "extend_num_tokens",
-            getattr(fwd_batch, "extend_num_tokens") - bs_joint_batch_boundary,
-        )
-
-    for key in [
-        "input_ids",
-        "positions",
-        "out_cache_loc",
-    ]:
-        setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:bs_joint_batch_boundary])
-        setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[bs_joint_batch_boundary:])
-
-    sub_fwd_batch0.batch_size=batch_boundary
-    sub_fwd_batch1.batch_size=fwd_batch.batch_size-sub_fwd_batch0.batch_size
-    return bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1
-
 ### WA: Temporary workaround code
 #################################
 #################################
@@ -650,7 +590,6 @@ class LlamaModel(nn.Module):
                 residual=residual,
                 start_layer=0,
             )
-            c=0
         else:
             for i in range(len(self.layers)):
                 if i in self.layers_to_capture:
