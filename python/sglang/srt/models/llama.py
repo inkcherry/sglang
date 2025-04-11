@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 #################################
 #################################
 
-TP_OVERLAP = True
+TP_OVERLAP = False
 # for debug
 # ASYNC_OP=False
 ASYNC_OP = False
@@ -343,7 +343,9 @@ class LlamaDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: int,
-    ):
+    ):  
+        print(f"L-{self.layer_id},input[{tbo_subbatch_index}] {hidden_states[0][0:5]}")
+
         state.update(
             dict(
                 forward_batch=forward_batch,
@@ -361,7 +363,8 @@ class LlamaDecoderLayer(nn.Module):
             if ASYNC_OP:
                 tp_b0_handle.wait()
             state.hidden_states_after_input_ln, state.residual_after_input_ln = self.input_layernorm(hidden_states, residual)
-    
+
+        
     def _forward_tbo_op_attn(self, state):
         state.hidden_states_after_attn = self.self_attn(
             positions=state.positions,
@@ -369,7 +372,7 @@ class LlamaDecoderLayer(nn.Module):
             forward_batch=state.forward_batch,
         )
         tp_b0_handle = torch.distributed.all_reduce(
-            state.hidden_states_after_input_ln, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
+            state.hidden_states_after_attn, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
         )
     def _forward_tbo_op_mlp(self, state):
          # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
@@ -389,6 +392,12 @@ class LlamaDecoderLayer(nn.Module):
             residual=state.residual_after_post_attn_ln,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
+        
+        print(f"L-{self.layer_id} ln[{state.tbo_subbatch_index}] {state.hidden_states_after_input_ln[0][0:5]}")
+        print(f"L-{self.layer_id} attn[{state.tbo_subbatch_index}] {state.hidden_states_after_attn[0][0:5]}")
+        print(f"L-{self.layer_id} mlp[{state.tbo_subbatch_index}] {state.hidden_states_after_mlp[0][0:5]}")
+
+
         state.clear()
         return output
 
@@ -427,16 +436,24 @@ class LlamaDecoderLayer(nn.Module):
         
         if not TP_OVERLAP or hidden_states1 is None:
             # Self Attention
+            
+            
+            print(f"L-{self.layer_id},input[] {hidden_states[0][0:5]}")
+
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            print(f"L-{self.layer_id},lm[] {hidden_states[0][0:5]}")
+
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            print(f"L-{self.layer_id},attn[] {hidden_states[0][0:5]}")
+
 
             if TP_OVERLAP:
                 hidden_states =tensor_model_parallel_all_reduce(hidden_states)
@@ -449,11 +466,13 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states, residual
             )
             hidden_states = self.mlp(hidden_states)
+            
             if TP_OVERLAP:
                 hidden_states=tensor_model_parallel_all_reduce(hidden_states)
                 # torch.distributed.all_reduce(
                 #     hidden_states, op=ReduceOp.SUM, group=group_
                 # )
+            print(f"L-{self.layer_id},mlp[] {hidden_states[0][0:5]}")
 
             return hidden_states, residual
         else:
@@ -597,6 +616,7 @@ class LlamaModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
+        
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -676,6 +696,7 @@ class LlamaModel(nn.Module):
                     forward_batch,
                     residual,
                 )
+                b=0
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
