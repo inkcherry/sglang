@@ -100,14 +100,14 @@ def token_balanced_batch_split(fwd_batch):
     for key in [
         "req_pool_indices",
         "seq_lens",
-        "decode_seq_lens_cpu",
+        "seq_lens_cpu",
         "extend_seq_lens",
         "extend_prefix_lens",
         "extend_start_loc",
         "extend_prefix_lens_cpu",
         "extend_seq_lens_cpu",
         "extend_logprob_start_lens_cpu",
-        "positions",
+        "lora_paths",
     ]:
         if getattr(fwd_batch, key) is not None:
             # skip for decode mode
@@ -166,7 +166,7 @@ class LlamaMLP(nn.Module):
             reduce_results=not TP_OVERLAP,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            reduce_results=reduce_results,
+            # reduce_results=reduce_results,
         )
         if hidden_act != "silu":
             raise ValueError(
