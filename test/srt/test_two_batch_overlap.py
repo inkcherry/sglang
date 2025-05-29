@@ -10,6 +10,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -32,10 +33,10 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "2",
                 "--dp",
                 "2",
-                "--enable-dp-attention",
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--enable-dp-attention",
                 "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
                 "--enable-two-batch-overlap",
             ],
@@ -121,15 +122,43 @@ class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
                 "2",
                 "--dp",
                 "2",
-                "--enable-dp-attention",
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--enable-dp-attention",
                 "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
                 "--enable-two-batch-overlap",
             ],
             env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
         )
+
+class TestLlamaTwoBatchOverlap(TestTwoBatchOverlap):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-1236"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--dp",
+                "2",
+                "--disable-radix-cache",
+                "--attention-backend",
+                "torch_native",
+                "--sampling-backend",
+                "pytorch",
+                "--disable-cuda-graph",
+            ],
+            env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
+        )
+
+
 
 
 if __name__ == "__main__":
