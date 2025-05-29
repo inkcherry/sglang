@@ -23,16 +23,30 @@ import triton.language as tl
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.dp_attention import (
-    dp_gather,
+    attn_tp_all_gather,
+    dp_gather_replicate,
     dp_scatter,
-    get_attention_dp_rank,
     get_attention_dp_size,
+    get_attention_tp_size,
+    get_local_attention_dp_rank,
+    get_local_attention_dp_size,
 )
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.utils import dump_to_file
+
+logger = logging.getLogger(__name__)
+
+
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
@@ -169,7 +183,7 @@ class LogitsMetadata:
             return
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        dp_rank = get_attention_dp_rank()
+        dp_rank = get_local_attention_dp_rank()
         if dp_rank == 0:
             dp_local_start_pos = torch.zeros_like(
                 self.global_num_tokens_for_logprob_gpu[0]
@@ -198,12 +212,20 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
-        self.do_tensor_parallel_all_gather = (
-            not skip_all_gather and get_tensor_model_parallel_world_size() > 1
-        )
-        self.do_tensor_parallel_all_gather_dp_attn = (
-            self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
-        )
+        self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
+        if self.use_attn_tp_group:
+            self.attn_tp_size = get_attention_tp_size()
+            self.do_tensor_parallel_all_gather = (
+                not skip_all_gather and self.attn_tp_size > 1
+            )
+            self.do_tensor_parallel_all_gather_dp_attn = False
+        else:
+            self.do_tensor_parallel_all_gather = (
+                not skip_all_gather and get_tensor_model_parallel_world_size() > 1
+            )
+            self.do_tensor_parallel_all_gather_dp_attn = (
+                self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
+            )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -223,16 +245,18 @@ class LogitsProcessor(nn.Module):
         hidden_states,
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        aux_hidden_states: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
-
         # Get the last hidden states and last logits for the next token prediction
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
         ):
             pruned_states = hidden_states
+            if aux_hidden_states is not None:
+                aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         elif (
@@ -256,6 +280,8 @@ class LogitsProcessor(nn.Module):
                     - 1
                 )
             pruned_states = hidden_states[last_index]
+            if aux_hidden_states is not None:
+                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -311,7 +337,8 @@ class LogitsProcessor(nn.Module):
 
         if self.debug_tensor_dump_output_folder:
             assert (
-                not self.do_tensor_parallel_all_gather or get_attention_dp_size() == 1
+                not self.do_tensor_parallel_all_gather
+                or get_local_attention_dp_size() == 1
             ), "dp attention + sharded lm_head doesn't support full logits"
             full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
             dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
@@ -319,13 +346,27 @@ class LogitsProcessor(nn.Module):
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
-                hidden_states_to_store = hidden_states
+                if aux_hidden_states is not None:
+                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+                    hidden_states_to_store = aux_hidden_states
+                else:
+                    hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
-                hidden_states_to_store = (
-                    pruned_states[sample_indices] if sample_indices else pruned_states
-                )
+                if aux_hidden_states is not None:
+                    aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
+                    hidden_states_to_store = (
+                        aux_pruned_states[sample_indices]
+                        if sample_indices is not None
+                        else aux_pruned_states
+                    )
+                else:
+                    hidden_states_to_store = (
+                        pruned_states[sample_indices]
+                        if sample_indices is not None
+                        else pruned_states
+                    )
             else:
                 assert False, "Should never reach"
 
@@ -410,7 +451,7 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.gathered_buffer,
                 hidden_states.clone(),
             )
-            dp_gather(hidden_states, local_hidden_states, logits_metadata, "embedding")
+            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
             logits = torch.matmul(
@@ -424,7 +465,19 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
-            logits = tensor_model_parallel_all_gather(logits)
+            if self.use_attn_tp_group:
+                global_logits = torch.empty(
+                    (self.config.vocab_size, logits.shape[0]),
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+                global_logits = global_logits.T
+                attn_tp_all_gather(
+                    list(global_logits.tensor_split(self.attn_tp_size, dim=-1)), logits
+                )
+                logits = global_logits
+            else:
+                logits = tensor_model_parallel_all_gather(logits)
 
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits, global_logits = (
