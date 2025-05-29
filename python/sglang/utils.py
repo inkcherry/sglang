@@ -22,11 +22,40 @@ from typing import Any, Callable, List, Optional, Tuple, Type, Union
 import numpy as np
 import requests
 from IPython.display import HTML, display
+from pydantic import BaseModel
 from tqdm import tqdm
 
-from sglang.srt.utils import kill_process_tree
-
 logger = logging.getLogger(__name__)
+
+
+def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+    """Convert a JSON schema to a string.
+    Parameters
+    ----------
+    json_schema
+        The JSON schema.
+    Returns
+    -------
+    str
+        The JSON schema converted to a string.
+    Raises
+    ------
+    ValueError
+        If the schema is not a dictionary, a string or a Pydantic class.
+    """
+    if isinstance(json_schema, dict):
+        schema_str = json.dumps(json_schema)
+    elif isinstance(json_schema, str):
+        schema_str = json_schema
+    elif issubclass(json_schema, BaseModel):
+        schema_str = json.dumps(json_schema.model_json_schema())
+    else:
+        raise ValueError(
+            f"Cannot parse schema {json_schema}. The schema must be either "
+            + "a Pydantic class, a dictionary or a string that contains the JSON "
+            + "schema specification"
+        )
+    return schema_str
 
 
 def get_exception_traceback():
@@ -249,7 +278,7 @@ def graceful_registry(sub_module_name: str):
             f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
         )
         if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} recive sigterm")
+            logger.info(f"{sub_module_name} receive sigterm")
 
     signal.signal(signal.SIGTERM, graceful_shutdown)
 
@@ -391,6 +420,8 @@ def terminate_process(process):
     """
     Terminate the process and automatically release the reserved port.
     """
+    from sglang.srt.utils import kill_process_tree
+
     kill_process_tree(process.pid)
 
     lock_socket = process_socket_map.pop(process, None)
@@ -405,7 +436,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
         base_url: The base URL of the server
         timeout: Maximum time to wait in seconds. None means wait forever.
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     while True:
         try:
             response = requests.get(
@@ -424,7 +455,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 )
                 break
 
-            if timeout and time.time() - start_time > timeout:
+            if timeout and time.perf_counter() - start_time > timeout:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)

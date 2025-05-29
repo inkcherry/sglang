@@ -4,19 +4,17 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
-      - "test/**"
-      - "docs/**"
+      - "python/**"
       - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test.yml"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
-      - "test/**"
-      - "docs/**"
+      - "python/**"
       - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -33,50 +31,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  filter:
-    runs-on: ubuntu-latest
-    outputs:
-      run_tests: ${{ steps.set_run_tests.outputs.run_tests }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Filter changes
-        id: filter
-        uses: dorny/paths-filter@v2
-        with:
-          filters: |
-            docs:
-              - 'docs/**'
-            scripts:
-              - 'scripts/**'
-            sglang:
-              - 'python/sglang/**'
-            test:
-              - 'test/**'
-            pyproject:
-              - 'python/pyproject.toml'
-      - name: Set run_tests output
-        id: set_run_tests
-        run: |
-          if [ "${{ steps.filter.outputs.sglang }}" == "true" ] || [ "${{ steps.filter.outputs.test }}" == "true" ] || [ "${{ steps.filter.outputs.pyproject }}" == "true" ]; then
-            echo "run_tests=true" >> $GITHUB_OUTPUT
-          else
-            echo "run_tests=false" >> $GITHUB_OUTPUT
-          fi
-
   unit-test-frontend:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -87,22 +50,18 @@ jobs:
           python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -110,73 +69,73 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 7
+          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 9
 
   unit-test-backend-2-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
-      - name: Test data parallelism (DP=2)
-        timeout-minutes: 10
+      - name: Run test
+        timeout-minutes: 30
         run: |
           cd test/srt
-          python3 test_data_parallelism.py
+          python3 run_suite.py --suite per-commit-2-gpu
 
-      - name: Test data parallelism attention (DP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_dp_attention.py
+  unittest-test-backend-4-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    needs: [unit-test-frontend, unit-test-backend-2-gpu]
+    runs-on: 4-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Test update weights from distributed
-        timeout-minutes: 10
+      - name: Install dependencies
         run: |
-          cd test/srt
-          python3 test_update_weights_from_distributed.py
+          bash scripts/ci_install_dependency.sh
 
-      - name: Test VerlEngine
-        timeout-minutes: 10
+      - name: Run test
+        timeout-minutes: 30
         run: |
           cd test/srt
-          python3 test_verl_engine.py
+          python3 run_suite.py --suite per-commit-4-gpu
 
-      - name: Test expert parallelism (EP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_moe_ep.py
+  unittest-test-backend-8-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    needs: [unit-test-frontend, unit-test-backend-2-gpu]
+    runs-on: 8-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Test torch compile (TP=2)
-        timeout-minutes: 10
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
         run: |
           cd test/srt
-          python3 test_mla_tp.py
+          python3 run_suite.py --suite per-commit-8-gpu
 
   performance-test-1-gpu-part-1:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -184,7 +143,8 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
 
       - name: Benchmark online latency
         timeout-minutes: 10
@@ -211,18 +171,14 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
   performance-test-1-gpu-part-2:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -244,19 +200,27 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
+      - name: Benchmark VLM offline throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
+
+      - name: Benchmark VLM online latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
+
   performance-test-2-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
 
@@ -265,8 +229,6 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
-
-          USE_VLLM_CUSTOM_ALLREDUCE=0 python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)
         timeout-minutes: 10
@@ -286,19 +248,27 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
+      - name: Benchmark offline decode throughput (PP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
+
+      - name: Benchmark offline prefill throughput (PP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
+
   accuracy-test-1-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
@@ -312,18 +282,14 @@ jobs:
           python3 test_eval_accuracy_large.py
 
   accuracy-test-2-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
         run: |
           bash scripts/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
@@ -339,9 +305,9 @@ jobs:
   finish:
     if: always()
     needs: [
-      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unittest-test-backend-8-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu
+      accuracy-test-1-gpu, accuracy-test-2-gpu,
     ]
     runs-on: ubuntu-latest
     steps:
