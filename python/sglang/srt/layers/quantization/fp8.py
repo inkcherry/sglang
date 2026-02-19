@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1580,6 +1581,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         no_combine: bool = False,
     ) -> Optional[torch.Tensor]:
         topk_weights, topk_ids, _ = topk_output
+        tp_rank = get_tensor_model_parallel_rank()
+        if tp_rank == 0:
+            b=0
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."

@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -557,7 +558,11 @@ def aiter_w8a8_block_fp8_linear(
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
-
+    tp_rank = get_tensor_model_parallel_rank()
+    
+    if tp_rank == 0:
+        # logger.info(f"aiter_w8a8_block_fp8_linear: {input.shape=}, {weight.shape=}")
+        b=0
     # if input_scale not None, input is quanted
     if input_scale is not None:
         q_input = input_2d
@@ -565,13 +570,15 @@ def aiter_w8a8_block_fp8_linear(
 
     else:
         q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
-
+   
     output = gemm_a8w8_blockscale(
         q_input,
         weight,
         x_scale,
         weight_scale,
         dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        skip_reduce=True,
+        # config={"NUM_KSPLIT": 4}
     )
 
     if bias is not None:
@@ -1104,7 +1111,9 @@ def apply_fp8_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
-
+    tp_rank = get_tensor_model_parallel_rank()
+    if tp_rank == 0:
+        b=0
     if compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
