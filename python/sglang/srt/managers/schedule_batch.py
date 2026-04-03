@@ -366,11 +366,6 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
 
-    def release_features(self):
-        """Release feature tensors to free GPU memory."""
-        for item in self.mm_items:
-            item.feature = None
-
     @staticmethod
     def from_dict(obj: dict):
         # Check if MM splitting is enabled
@@ -646,6 +641,7 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
+        self.last_host_backup_node: Any = None  # compat: may not exist in MatchResult
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
