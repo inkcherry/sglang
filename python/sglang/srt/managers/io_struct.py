@@ -1008,6 +1008,17 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
+try:
+    from sglang.srt.managers.fast_ipc import register_fast_ipc as _reg_fipc
+
+    _reg_fipc(
+        BatchTokenIDOutput,
+        pickle_only_fields=frozenset({"time_stats", "routed_experts"}),
+    )
+except ImportError:
+    pass
+
+
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
     decoded_ids: List[int]
@@ -1102,6 +1113,15 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
+# Register BatchStrOutput for fast IPC serialization (msgpack)
+try:
+    from sglang.srt.managers.fast_ipc import register_fast_ipc as _reg_fipc
+
+    _reg_fipc(BatchStrOutput)
+except ImportError:
+    pass
+
+
 @dataclass
 class BatchMultimodalOutput(BaseBatchReq):
     # The finish reason
@@ -1166,13 +1186,12 @@ class ClearHiCacheReqOutput(BaseReq):
 
 @dataclass
 class FlushCacheReqInput(BaseReq):
-    timeout_s: Optional[float] = None
+    pass
 
 
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
-    message: str = ""
 
 
 @dataclass

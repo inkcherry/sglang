@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
@@ -67,7 +68,6 @@ class DecodeStatus:
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
-    # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
 
 
@@ -123,6 +123,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.is_dummy = False
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
+        self._decode_pool = ThreadPoolExecutor(max_workers=2)
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -225,8 +226,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
 
-        # Initialize decode status
         read_ids, surr_ids = [], []
+
         for i in range(bs):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
@@ -237,7 +238,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     read_offset=recv_obj.read_offsets[i],
                 )
                 if not self.is_health_check_request(rid):
-                    # for health check requests, we do not store the decode status
                     self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
@@ -252,26 +252,26 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             )
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
-        # Decode token ids to strings
         if not self.disable_tokenizer_batch_decode:
             if not self.is_dummy:
-                # Run normal batch decode
-                surr_texts = self._grouped_batch_decode(
+                surr_future = self._decode_pool.submit(
+                    self._grouped_batch_decode,
                     surr_ids,
                     recv_obj.skip_special_tokens,
                     recv_obj.spaces_between_special_tokens,
                 )
-                read_texts = self._grouped_batch_decode(
+                read_future = self._decode_pool.submit(
+                    self._grouped_batch_decode,
                     read_ids,
                     recv_obj.skip_special_tokens,
                     recv_obj.spaces_between_special_tokens,
                 )
+                surr_texts = surr_future.result()
+                read_texts = read_future.result()
             else:
-                # If it is dummy weights, just return dummy strings to prevent potential detokenization edge cases
                 surr_texts = ["dog" for _ in surr_ids]
                 read_texts = ["cat" for _ in read_ids]
         else:
-            # Do not use batch decode to prevent some detokenization edge cases (e.g., gpt-oss).
             surr_texts = [
                 self.tokenizer.decode(
                     surr, skip_special_tokens=skip, spaces_between_special_tokens=space
@@ -293,7 +293,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
             ]
 
-        # Incremental decoding
         output_strs = []
         for i in range(bs):
             rid = recv_obj.rids[i]
@@ -318,7 +317,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     )
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
-                # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):
                     s.decoded_text = s.decoded_text + new_text
                     s.surr_offset = s.read_offset
@@ -335,7 +333,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 recv_obj.finished_reasons[i],
                 recv_obj.no_stop_trim[i],
             )
-            # Incrementally send text.
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
@@ -435,7 +432,6 @@ def run_detokenizer_process(
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 
-    manager = None
     try:
         manager = detokenizer_manager_class(server_args, port_args)
         if server_args.tokenizer_worker_num == 1:
@@ -445,6 +441,5 @@ def run_detokenizer_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
-        if manager is not None:
-            manager.maybe_clear_socket_mapping()
+        manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)
