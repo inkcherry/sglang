@@ -88,6 +88,10 @@ class MoriEPLLDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    # Host-side avg #tokens per local expert under uniform routing. Plumbed
+    # into AITER fused_moe as a SM-scheduling hint -- mirrors DeepEP's
+    # DeepEPLLDispatchOutput.expected_m. None preserves legacy behavior.
+    expected_m: Optional[int] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -831,6 +835,15 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
 
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
+        # Mirror DeepEP LL's expected_m computation: avg #tokens each local
+        # expert would receive under perfectly uniform routing. Used downstream
+        # by AITER fused_moe to pick the right CSV tier for SM scheduling.
+        # Computed on host BEFORE the dispatch all-to-all so it's free.
+        world_size = get_moe_expert_parallel_world_size()
+        expected_m = (
+            num_tokens * world_size * topk_ids.shape[1] + self.num_experts
+        ) // self.num_experts
+
         (
             packed_recv_hidden,
             recv_topk_weights,
@@ -848,6 +861,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             topk_weights,
             topk_ids,
             output_dtype,
+            expected_m,
         )
 
     def dispatch_b(
@@ -860,6 +874,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         topk_weights,
         topk_ids,
         output_dtype,
+        expected_m,
     ):
 
         ##TODO(billishyahao): add assertion here to check async
@@ -881,6 +896,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            expected_m=expected_m,
         )
 
     def _dispatch_core(

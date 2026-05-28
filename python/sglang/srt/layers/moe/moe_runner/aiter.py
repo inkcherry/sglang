@@ -72,6 +72,10 @@ class AiterRunnerInput(RunnerInput):
     # Mori-only fused_moe kwargs.
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
+    # Host-side avg #tokens per local expert under uniform routing. Only set
+    # by DeepEP/Mori low-latency dispatch; AITER fused_moe uses it as a SM-
+    # scheduling hint to escape the worst-case padded-buffer M tier.
+    expected_m: Optional[int] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -128,6 +132,8 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        if runner_input.expected_m is not None:
+            extra["expected_m"] = runner_input.expected_m
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -244,6 +250,11 @@ def _pre_permute_deepep_to_aiter(
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
     quant_type = quant_info.quant_type
+    # Lift expected_m off LL dispatch outputs (both mori and deepep set it on
+    # their LL output dataclass; Normal outputs don't carry the field, and the
+    # legacy M-from-topk_ids path stays correct for Normal). Stays None for
+    # Normal dispatch, preserving prior behavior.
+    expected_m: Optional[int] = getattr(dispatch_output, "expected_m", None)
 
     if is_mori:
         from sglang.srt.layers.moe.rocm_moe_utils import upscale, upscale_mxfp4
@@ -319,6 +330,7 @@ def _pre_permute_deepep_to_aiter(
         a1_scale=a1_scale,
         num_local_tokens=num_local_tokens,
         output_dtype=output_dtype,
+        expected_m=expected_m,
     )
 
 
