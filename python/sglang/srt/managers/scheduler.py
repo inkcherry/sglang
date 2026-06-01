@@ -310,8 +310,8 @@ def _apply_mock_forward_overrides(server_args: ServerArgs) -> None:
     incompat = []
     if server_args.speculative_algorithm:
         incompat.append(f"speculative_algorithm={server_args.speculative_algorithm}")
-    if server_args.tp_size > 1:
-        incompat.append(f"tp_size={server_args.tp_size} (v1 supports TP=1 only)")
+    # tp_size > 1 is allowed: every rank short-circuits forward identically,
+    # so cross-rank state stays in sync. See git log for spike data.
     if server_args.dp_size > 1:
         incompat.append(f"dp_size={server_args.dp_size} (v1 supports DP=1 only)")
     if (
