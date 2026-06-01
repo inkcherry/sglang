@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -452,6 +453,14 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
+        # Mock forward short-circuit: skip ALL GPU work (ForwardBatch.init_new,
+        # model_runner.forward, model_runner.sample) and return shape-valid
+        # fake output. Scheduler / KV allocator / detokenizer pipeline above
+        # this layer remain unaffected. See docs/dev/mock_forward.md.
+        if envs.SGLANG_MOCK_FORWARD.get() and batch is not None:
+            from sglang.srt.managers.mock_forward import mock_forward_batch_generation
+            return mock_forward_batch_generation(batch, self.model_runner)
+
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 

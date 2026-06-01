@@ -1273,6 +1273,20 @@ class Req(ReqDllmMixin):
         if self.finished():
             return
 
+        # Mock forward: finish purely by output length, bypassing all EOS /
+        # stop_str / grammar / vocab-boundary checks. fake next_token_ids are
+        # a fixed constant and would either never trigger natural stops or
+        # accidentally trigger them, both useless for scheduler testing.
+        if envs.SGLANG_MOCK_FORWARD.get():
+            target = min(
+                envs.SGLANG_MOCK_FORWARD_OUTPUT_LEN.get(),
+                self.sampling_params.max_new_tokens,
+            )
+            if len(self.output_ids) >= target:
+                self.finished_reason = FINISH_LENGTH(length=target)
+                self.finished_len = target
+            return
+
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None

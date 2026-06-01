@@ -247,6 +247,11 @@ class Envs:
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
 
+    # Mock forward (scheduler-only testing; bypasses GPU forward, outputs are fake)
+    # See docs/dev/mock_forward.md before using.
+    SGLANG_MOCK_FORWARD = EnvBool(False)
+    SGLANG_MOCK_FORWARD_OUTPUT_LEN = EnvInt(32)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

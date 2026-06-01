@@ -283,6 +283,66 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 _is_npu = is_npu()
 
 
+def _apply_mock_forward_overrides(server_args: ServerArgs) -> None:
+    """Validate and adjust server_args when SGLANG_MOCK_FORWARD is set.
+
+    Mock forward (testing-only) replaces tp_worker.forward_batch_generation
+    with a fake. Several features are either incompatible with that or
+    pointless under it:
+
+      - Hard incompatible (raise): speculative decoding, multi-TP/DP,
+        disaggregation, PD multiplexing. Each of these takes a code path
+        the v1 mock does not cover.
+
+      - Force-disabled (warn): cuda_graph capture (uses dummy_run which
+        depends on a real forward) and overlap_schedule (overlap exists
+        solely to hide GPU forward time, which is zero under mock; it
+        also pulls in a CUDA-only JIT kernel that crashes on ROCm).
+
+    Must be called BEFORE any code reads server_args fields, since those
+    reads cache derived state (e.g. self.enable_overlap on line ~331).
+
+    See docs/dev/mock_forward.md.
+    """
+    if not envs.SGLANG_MOCK_FORWARD.get():
+        return
+
+    incompat = []
+    if server_args.speculative_algorithm:
+        incompat.append(f"speculative_algorithm={server_args.speculative_algorithm}")
+    if server_args.tp_size > 1:
+        incompat.append(f"tp_size={server_args.tp_size} (v1 supports TP=1 only)")
+    if server_args.dp_size > 1:
+        incompat.append(f"dp_size={server_args.dp_size} (v1 supports DP=1 only)")
+    if (
+        getattr(server_args, "disaggregation_mode", "null")
+        and server_args.disaggregation_mode != "null"
+    ):
+        incompat.append(f"disaggregation_mode={server_args.disaggregation_mode}")
+    if getattr(server_args, "enable_pdmux", False):
+        incompat.append("enable_pdmux")
+    if incompat:
+        raise NotImplementedError(
+            "SGLANG_MOCK_FORWARD v1 is incompatible with: "
+            + ", ".join(incompat)
+            + ". See docs/dev/mock_forward.md."
+        )
+
+    if not server_args.disable_cuda_graph:
+        server_args.disable_cuda_graph = True
+        logger.warning(
+            "SGLANG_MOCK_FORWARD: forcing --disable-cuda-graph "
+            "(CUDA graph capture relies on a real forward via dummy_run)."
+        )
+    if not server_args.disable_overlap_schedule:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "SGLANG_MOCK_FORWARD: forcing --disable-overlap-schedule "
+            "(overlap only hides GPU forward time, which is zero under mock; "
+            "also avoids the CUDA-only resolve_future_token_ids JIT kernel)."
+        )
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -309,6 +369,12 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch: Optional[ScheduleBatch] = None
+
+        # Mock forward overrides MUST run before any server_args-derived
+        # attribute is computed below (e.g. self.enable_overlap on line ~331).
+        # Mutates server_args in place; no-op when SGLANG_MOCK_FORWARD unset.
+        _apply_mock_forward_overrides(server_args)
+
         self.init_soft_watchdog(server_args)
 
         # Parse args
