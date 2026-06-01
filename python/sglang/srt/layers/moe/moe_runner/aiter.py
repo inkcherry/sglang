@@ -72,9 +72,15 @@ class AiterRunnerInput(RunnerInput):
     # Mori-only fused_moe kwargs.
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
-    # Host-side avg #tokens per local expert under uniform routing. Only set
-    # by DeepEP/Mori low-latency dispatch; AITER fused_moe uses it as a SM-
-    # scheduling hint to escape the worst-case padded-buffer M tier.
+    # M the AITER fused_moe should use when looking up its GEMM CSV tier.
+    # Every sglang dispatch output now carries `expected_m`, so the pre-
+    # permute always fills this in (Normal path with topk_ids.shape[0] --
+    # bit-identical to legacy; LL path with the uniform-routing avg, which
+    # escapes the worst-case padded-buffer M tier). Default kept as None for
+    # dataclass field-ordering only; sglang callers always pass an int.
+    # NB: the downstream AITER public API still takes Optional[int]=None
+    # (non-EP callers don't have a dispatcher to compute it), so we keep
+    # passing None through to aiter when expected_m is None here.
     expected_m: Optional[int] = None
 
     @property
@@ -250,11 +256,13 @@ def _pre_permute_deepep_to_aiter(
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
     quant_type = quant_info.quant_type
-    # Lift expected_m off LL dispatch outputs (both mori and deepep set it on
-    # their LL output dataclass; Normal outputs don't carry the field, and the
-    # legacy M-from-topk_ids path stays correct for Normal). Stays None for
-    # Normal dispatch, preserving prior behavior.
-    expected_m: Optional[int] = getattr(dispatch_output, "expected_m", None)
+    # Every dispatch output we accept (deepep_normal / deepep_ll / mori_
+    # normal / mori_ll) now carries expected_m as a required int (see the
+    # NamedTuple definitions). Normal-path expected_m = topk_ids.shape[0]
+    # is bit-identical to the legacy behavior; LL-path expected_m is the
+    # uniform-routing avg, which AITER fused_moe uses to pick a small CSV
+    # tier instead of pegging at the padded buffer worst case.
+    expected_m: int = int(dispatch_output.expected_m)
 
     if is_mori:
         from sglang.srt.layers.moe.rocm_moe_utils import upscale, upscale_mxfp4

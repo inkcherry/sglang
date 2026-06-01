@@ -71,6 +71,12 @@ class MoriEPNormalDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    # M value the runner should use when looking up the GEMM tier in AITER
+    # fused_moe. For the Normal path this is just topk_ids.shape[0] (compact
+    # layout = real total recv tokens), so passing it preserves the legacy
+    # behavior bit-for-bit. Kept here so the downstream runner can read
+    # `output.expected_m` uniformly across Normal and LL dispatch outputs.
+    expected_m: int
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -88,10 +94,11 @@ class MoriEPLLDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
-    # Host-side avg #tokens per local expert under uniform routing. Plumbed
-    # into AITER fused_moe as a SM-scheduling hint -- mirrors DeepEP's
-    # DeepEPLLDispatchOutput.expected_m. None preserves legacy behavior.
-    expected_m: Optional[int] = None
+    # Host-side avg #tokens per (global) expert under uniform routing -- the
+    # SM scheduling hint AITER fused_moe uses to pick a small/realistic CSV
+    # tier instead of pegging at the padded worst-case M. Same formula as
+    # DeepEPLLDispatchOutput.expected_m.
+    expected_m: int
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -625,6 +632,10 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            # Normal path is compact: shape[0] IS the real total recv tokens.
+            # Passing it explicitly so downstream runner can read expected_m
+            # uniformly; numerically equivalent to the legacy M-from-topk_ids.
+            expected_m=int(recv_topk_ids.shape[0]),
         )
 
     def _dispatch_core(

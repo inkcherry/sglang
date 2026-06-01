@@ -90,6 +90,11 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
+    # M the downstream runner should use to look up the GEMM tier (AITER
+    # fused_moe). Normal dispatch is compact, so this is just topk_ids.
+    # shape[0] (real total recv tokens). Mirrors DeepEPLLDispatchOutput.
+    # expected_m so the runner can read `output.expected_m` uniformly.
+    expected_m: int
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -502,6 +507,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             topk_ids,
             topk_weights,
             num_recv_tokens_per_expert,
+            int(topk_ids.shape[0]),
         )
 
     def _dispatch_core(
