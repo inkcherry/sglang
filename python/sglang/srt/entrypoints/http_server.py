@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -412,6 +413,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _mock_forward_response_header(request: Request, call_next):
+    """Stamp every response with SGLang-Mock-Forward: true when the server
+    is running in mock-forward mode, so clients hitting a testing-only
+    server can detect it. No-op otherwise.
+
+    See docs/dev/mock_forward.md.
+    """
+    response = await call_next(request)
+    if envs.SGLANG_MOCK_FORWARD.get():
+        response.headers["SGLang-Mock-Forward"] = "true"
+    return response
+
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -2320,6 +2336,38 @@ def _setup_and_run_http_server(
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
+def _print_mock_forward_banner_if_enabled() -> None:
+    """Print a hard-to-miss banner to stderr when mock forward is on.
+
+    Emitted in the launcher process before any subprocess fork so the
+    warning is the first thing the operator sees. No-op when disabled.
+    """
+    if not envs.SGLANG_MOCK_FORWARD.get():
+        return
+    output_len = envs.SGLANG_MOCK_FORWARD_OUTPUT_LEN.get()
+    bar = "=" * 78
+    banner = "\n".join(
+        [
+            "",
+            bar,
+            "SGLANG_MOCK_FORWARD ENABLED -- ALL GENERATED TOKENS ARE FAKE",
+            bar,
+            f"Output length per request : {output_len} tokens (SGLANG_MOCK_FORWARD_OUTPUT_LEN)",
+            "GPU forward path          : BYPASSED",
+            "Scheduler / KV / ZMQ      : real",
+            "",
+            "This mode is for SCHEDULER-PATH TESTING ONLY. Do not use for:",
+            "  - PR performance comparisons (hides GPU-side regressions)",
+            "  - Capacity planning (GPU time is what matters in production)",
+            "  - Output validation (tokens are pre-determined fakes)",
+            "See docs/dev/mock_forward.md.",
+            bar,
+            "",
+        ]
+    )
+    print(banner, file=sys.stderr, flush=True)
+
+
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -2343,6 +2391,8 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    _print_mock_forward_banner_if_enabled()
+
     # Launch subprocesses
     (
         tokenizer_manager,
