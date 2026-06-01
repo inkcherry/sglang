@@ -312,8 +312,11 @@ def _apply_mock_forward_overrides(server_args: ServerArgs) -> None:
         incompat.append(f"speculative_algorithm={server_args.speculative_algorithm}")
     # tp_size > 1 is allowed: every rank short-circuits forward identically,
     # so cross-rank state stays in sync. See git log for spike data.
-    if server_args.dp_size > 1:
-        incompat.append(f"dp_size={server_args.dp_size} (v1 supports DP=1 only)")
+    # dp_size > 1 is allowed (both basic DP and DP attention spike-validated):
+    # each DP rank is an independent scheduler+worker process with its own
+    # model copy and KV pool, so cross-rank dependencies are minimal; the
+    # few that exist (e.g. prepare_mlp_sync_batch under --enable-dp-attention)
+    # are bypassed identically on every rank.
     if (
         getattr(server_args, "disaggregation_mode", "null")
         and server_args.disaggregation_mode != "null"
