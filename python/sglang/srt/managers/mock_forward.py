@@ -46,10 +46,19 @@ def mock_forward_batch_generation(
     dtype = model_runner.dtype
 
     # Fake logits: zeros are fine because we also bypass the real sampler.
-    # Shape must match what downstream code (overlap scheduler, return_logprob
-    # path) expects: [batch_size, vocab_size].
+    # Shape (bs, vocab_size) is what downstream readers expect.
     fake_logits = torch.zeros((bs, vocab_size), device=device, dtype=dtype)
-    logits_output = LogitsProcessorOutput(next_token_logits=fake_logits)
+    # Fake logprobs: populated only so requests with return_logprob=True
+    # do not crash on None.tolist() / None[i] in batch_result_processor /
+    # logprob_result_processor. Values are meaningless under mock; only
+    # shape and dtype matter. top_logprobs and token_ids_logprobs (the
+    # list-valued fields) are left as defaults; requests using those
+    # extras may still encounter empty-list behavior downstream.
+    fake_logprobs = torch.zeros((bs,), device=device, dtype=torch.float32)
+    logits_output = LogitsProcessorOutput(
+        next_token_logits=fake_logits,
+        next_token_logprobs=fake_logprobs,
+    )
 
     # Fake next_token_ids: pick a deterministic mid-vocab token. We avoid 0
     # (often <pad>) and stay well clear of common EOS ranges. The actual

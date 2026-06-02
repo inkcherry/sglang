@@ -44,6 +44,8 @@ def _server_args_stub(**overrides):
         speculative_algorithm=None,
         tp_size=1,
         dp_size=1,
+        pp_size=1,
+        is_embedding=False,
         disaggregation_mode="null",
         enable_pdmux=False,
         disable_cuda_graph=True,
@@ -135,6 +137,20 @@ class TestApplyMockForwardOverrides(CustomTestCase):
             with self.assertRaises(NotImplementedError) as cm:
                 self.fn(sa)
             self.assertIn("enable_pdmux", str(cm.exception))
+
+    def test_raise_on_pp_gt_1(self):
+        with envs.SGLANG_MOCK_FORWARD.override(True):
+            sa = _server_args_stub(pp_size=2)
+            with self.assertRaises(NotImplementedError) as cm:
+                self.fn(sa)
+            self.assertIn("pp_size=2", str(cm.exception))
+
+    def test_raise_on_embedding_model(self):
+        with envs.SGLANG_MOCK_FORWARD.override(True):
+            sa = _server_args_stub(is_embedding=True)
+            with self.assertRaises(NotImplementedError) as cm:
+                self.fn(sa)
+            self.assertIn("is_embedding", str(cm.exception))
 
     def test_collect_multiple_incompat(self):
         with envs.SGLANG_MOCK_FORWARD.override(True):
@@ -255,6 +271,16 @@ class TestMockForwardBatchGeneration(CustomTestCase):
         # vocab_size=1 -> max(1, 0) = 1, ensures token 0 is not picked
         out = self._call(batch_size=1, vocab_size=1)
         self.assertEqual(out.next_token_ids[0].item(), 1)
+
+    def test_logprobs_populated_for_return_logprob_path(self):
+        # next_token_logprobs must be a tensor (not None) so that downstream
+        # batch_result_processor / logprob_result_processor do not crash on
+        # None.tolist() / None[i] when a request has return_logprob=True.
+        out = self._call(batch_size=4, vocab_size=128)
+        lp = out.logits_output.next_token_logprobs
+        self.assertIsNotNone(lp)
+        self.assertEqual(tuple(lp.shape), (4,))
+        self.assertTrue(torch.equal(lp, torch.zeros_like(lp)))
 
 
 class TestUpdateFinishStateMockBranch(CustomTestCase):

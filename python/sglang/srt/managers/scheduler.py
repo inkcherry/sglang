@@ -324,6 +324,23 @@ def _apply_mock_forward_overrides(server_args: ServerArgs) -> None:
         incompat.append(f"disaggregation_mode={server_args.disaggregation_mode}")
     if getattr(server_args, "enable_pdmux", False):
         incompat.append("enable_pdmux")
+    if getattr(server_args, "pp_size", 1) > 1:
+        # Non-last PP rank in tp_worker.forward_batch_generation returns
+        # GenerationBatchResult(pp_hidden_states_proxy_tensors=...); the
+        # mock cut point does not produce these proxy tensors, so PP
+        # send/recv on non-last ranks would crash or send garbage.
+        incompat.append(
+            f"pp_size={server_args.pp_size} (PP non-last ranks need "
+            "pp_hidden_states_proxy_tensors)"
+        )
+    if getattr(server_args, "is_embedding", False):
+        # Embedding/reward models go through tp_worker.forward_batch_embedding,
+        # which is outside our cut point: mock would silently NOT apply and
+        # the server would still try a real forward.
+        incompat.append(
+            "is_embedding=True (forward_batch_embedding path is "
+            "outside the mock cut point)"
+        )
     if incompat:
         raise NotImplementedError(
             "SGLANG_MOCK_FORWARD v1 is incompatible with: "
@@ -374,7 +391,8 @@ class Scheduler(
         self.cur_batch: Optional[ScheduleBatch] = None
 
         # Mock forward overrides MUST run before any server_args-derived
-        # attribute is computed below (e.g. self.enable_overlap on line ~331).
+        # attribute is computed below (e.g. self.enable_overlap is derived
+        # from disable_overlap_schedule a few lines down).
         # Mutates server_args in place; no-op when SGLANG_MOCK_FORWARD unset.
         _apply_mock_forward_overrides(server_args)
 
