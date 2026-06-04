@@ -204,9 +204,66 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
     }
 
 
+_MIN_DISPATCH_TOKEN_TIER = 32
+
+
+def _ceil_pow2(n: int) -> int:
+    p = _MIN_DISPATCH_TOKEN_TIER
+    while p < n:
+        p *= 2
+    return p
+
+
+def _build_dispatch_token_tiers(base_max: int) -> List[int]:
+    """Power-of-two ladder of per-rank mori dispatch-buffer sizes (32 .. top).
+
+    Lets a single decode server serve many concurrency levels without a restart:
+    each captured CUDA-graph bs binds the smallest tier whose per-rank buffer
+    covers that bs's token count, so a conc-64 step replays a small-tier graph
+    (fast) while a conc-1024 step replays the big-tier graph -- on the same
+    server, no env change.
+
+    The ladder top is the per-rank dispatch-token capacity, clamped to
+    ``base_max`` (= ``SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK``) and further
+    bounded by ``max_running_requests`` (the largest captured bs cannot exceed
+    the per-dp-rank request pool, so larger tiers would never be selected). The
+    prefill server always dispatches large extend batches (always the max tier),
+    so it keeps a single buffer.
+    """
+    top = base_max
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        sa = get_global_server_args()
+        if sa.disaggregation_mode == "prefill":
+            return [base_max]
+        mrr = sa.max_running_requests
+        if mrr:
+            dp = sa.dp_size if getattr(sa, "enable_dp_attention", False) else 1
+            per_rank_reqs = max(1, -(-mrr // max(1, dp)))  # ceil division
+            tokens_per_req = getattr(sa, "speculative_num_draft_tokens", None) or 1
+            need = _ceil_pow2(per_rank_reqs * tokens_per_req)
+            top = min(base_max, max(_MIN_DISPATCH_TOKEN_TIER, need))
+    except Exception:
+        # Global server args not available yet (or unexpected shape): fall back
+        # to the full ladder up to base_max.
+        top = base_max
+
+    if top <= _MIN_DISPATCH_TOKEN_TIER:
+        return [top]
+    tiers, t = [], _MIN_DISPATCH_TOKEN_TIER
+    while t < top:
+        tiers.append(t)
+        t *= 2
+    tiers.append(top)
+    return tiers
+
+
 # init_mori_op only needs do once in model initial stage
-# use lru_cache to reuse the same mori_op instance to avoid the init overhead for mori
-@lru_cache(maxsize=4)
+# use lru_cache to reuse the same mori_op instance to avoid the init overhead for
+# mori. maxsize is generous so the per-tier ops of the multi-tier path (a handful
+# of tiers x normal/LL impls x instance_ids) are never evicted and re-created.
+@lru_cache(maxsize=64)
 def init_mori_op(
     group,
     router_topk,
@@ -391,13 +448,24 @@ class _MoriEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
         self.instance_id = instance_id
 
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
+        base_max = get_int_env_var(
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
+        # Per-rank dispatch-buffer tiers: a power-of-two ladder (32 .. top) so a
+        # single decode server serves many concurrency levels without a restart.
+        # The dispatcher builds one mori op per tier and binds the right-sized one
+        # into each captured CUDA-graph bs (see _select_dispatch_tokens_tier for
+        # the cross-rank-safety rule). The ladder top is bounded by base_max and
+        # by max_running_requests; prefill keeps a single buffer.
+        self._dispatch_token_tiers = _build_dispatch_token_tiers(base_max)
+        self.num_max_dispatch_tokens_per_rank = max(self._dispatch_token_tiers)
 
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
 
-        self._mori_op = None
+        # tier (per-rank token count) -> mori op. Built as a full set on first
+        # eager access (a warmup forward), never during CUDA-graph capture.
+        self._mori_ops: dict = {}
+        self._active_dispatch_tokens = self.num_max_dispatch_tokens_per_rank
         self.dispatch_dtype = DispatchDtype.bf16
         self.combine_dtype = CombineDtype.bf16
 
@@ -408,25 +476,68 @@ class _MoriEPDispatcherImplBase:
 
     @property
     def mori_op(self):
-        if self._mori_op is None:
-            # If set_quant_config was never called, apply env var override now
-            if self.quant_config is None:
-                self._apply_dispatch_dtype_override()
-            self._mori_op = init_mori_op(
+        return self._get_active_op()
+
+    def _ensure_ops_built(self):
+        if self._mori_ops:
+            return
+        # If set_quant_config was never called, apply env var override now.
+        if self.quant_config is None:
+            self._apply_dispatch_dtype_override()
+        # Op construction allocates symmetric memory / runs collectives, so it
+        # must not happen inside CUDA-graph capture. The first dispatch is a
+        # warmup (eager) forward, which is where the full tier set is built. The
+        # capturing fallback (build only the max tier) is a safety net that
+        # should not trigger in practice.
+        if torch.cuda.is_current_stream_capturing():
+            tiers = [self.num_max_dispatch_tokens_per_rank]
+        else:
+            tiers = self._dispatch_token_tiers
+        for tier in tiers:
+            self._mori_ops[tier] = init_mori_op(
                 self.group,
                 self.router_topk,
                 self.num_experts,
                 self.num_local_experts,
                 self.hidden_size,
                 self.params_dtype,
-                self.num_max_dispatch_tokens_per_rank,
+                tier,
                 self.deepep_mode,
                 self.instance_id,
                 self.dispatch_dtype,
                 self.combine_dtype,
                 self.enable_sdma,
             )
-        return self._mori_op
+
+    def _select_dispatch_tokens_tier(self, num_tokens: int) -> int:
+        """Pick the per-rank dispatch-buffer tier for the current forward.
+
+        Only right-size during CUDA-graph capture: there DP attention pads the
+        batch to a uniform size across every EP rank, so all ranks select the
+        same tier and the collective dispatch/combine stays consistent. In eager
+        mode per-rank token counts can diverge, so fall back to the max tier
+        (identical to the original single-buffer behavior).
+        """
+        if len(self._dispatch_token_tiers) == 1:
+            return self._dispatch_token_tiers[0]
+        if not torch.cuda.is_current_stream_capturing():
+            return self.num_max_dispatch_tokens_per_rank
+        for tier in self._dispatch_token_tiers:  # ascending
+            if tier >= num_tokens:
+                return tier
+        return self.num_max_dispatch_tokens_per_rank
+
+    def _set_active_op(self, num_tokens: int):
+        self._ensure_ops_built()
+        self._active_dispatch_tokens = self._select_dispatch_tokens_tier(num_tokens)
+
+    def _get_active_op(self):
+        self._ensure_ops_built()
+        op = self._mori_ops.get(self._active_dispatch_tokens)
+        if op is None:
+            # Tier not pre-built (capture-time fallback) -> use the largest built.
+            op = self._mori_ops[max(self._mori_ops)]
+        return op
 
     def _apply_dispatch_dtype_override(self):
         """Apply env var override to fp8_dispatch/fp4_dispatch/fp8_combine flags."""
@@ -577,6 +688,10 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
         num_token = hidden_states.shape[0]
+        # Bind the dispatch-buffer tier for this forward (see _set_active_op).
+        # Must precede any self.mori_op access so the right-sized op is used /
+        # captured into the CUDA graph for this bs.
+        self._set_active_op(num_token)
         output_dtype = hidden_states.dtype
         scale = None
 
@@ -829,6 +944,11 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         topk_output: TopKOutput,
     ):
         import mori
+
+        # Bind the dispatch-buffer tier for this forward (see _set_active_op).
+        # Must precede any self.mori_op access so the right-sized op is used /
+        # captured into the CUDA graph for this bs.
+        self._set_active_op(hidden_states.shape[0])
 
         assert (
             self.mori_op.config.kernel_type
