@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.srt.distributed import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -302,6 +303,26 @@ def _pre_permute_deepep_to_aiter(
         running_state["aiter_combine_topk_weights"] = (
             dispatch_output.origin_topk_weights
         )
+
+        # Truncate the padded mori dispatch tensors to this forward's bs upper
+        # bound: per-rank tokens (origin_topk_ids.shape[0], the CUDA-graph key)
+        # * EP world size. mori recv is compact and combine only reads
+        # [0, totalRecvTokenNum), so dropping the padded tail needs no pad-back.
+        # The cap is host-static, so each captured bs bakes in its own slice
+        # length -> fused_moe permute/sort/GEMM/combine scale with the real
+        # concurrency instead of the worst-case dispatch buffer. This replaces
+        # the fixed SGLANG_MORI_MOE_MAX_INPUT_TOKENS truncation (which could be
+        # set too small and silently drop rows); expected_m is orthogonal and
+        # only picks the fused_moe kernel tier.
+        cap = (
+            dispatch_output.origin_topk_ids.shape[0]
+            * get_moe_expert_parallel_world_size()
+        )
+        hidden_states = hidden_states[:cap]
+        if a1_scale is not None:
+            a1_scale = a1_scale[:cap]
+        topk_ids = topk_ids[:cap]
+        topk_weights = topk_weights[:cap]
     else:
         # DeepEP marks invalid topk slots with idx == -1; AITER cannot accept
         # negative ids, so reroute them to the sink slot at index
