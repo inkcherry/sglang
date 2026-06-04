@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.srt.distributed import get_moe_expert_parallel_world_size
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -302,6 +304,33 @@ def _pre_permute_deepep_to_aiter(
         running_state["aiter_combine_topk_weights"] = (
             dispatch_output.origin_topk_weights
         )
+
+        # Truncate the padded mori dispatch tensors back to this decode forward's
+        # recv upper bound. CI (InferenceMINI server_sglang.sh) sizes the decode
+        # per-rank dispatch buffer as
+        #     perrank = (concurrency / tp) * (MTP + 1)
+        # which at runtime equals this forward's per-rank token count
+        # origin_topk_ids.shape[0] (= bs_per_rank * num_draft_tokens). The recv
+        # upper bound is therefore perrank * ep_size, while mori pads the recv
+        # buffer to the worst case (max_dispatch_tokens_per_rank * ep_size).
+        # Slicing to perrank * ws lets fused_moe permute/sort/GEMM/combine scale
+        # with the live concurrency instead of the padded buffer, so one decode
+        # server serves many concurrencies without a restart. mori dispatch is
+        # tail-padded (real tokens in [0, totalRecvTokenNum)), so dropping the
+        # tail needs no pad-back; expected_m is orthogonal (kernel-tier lookup).
+        # Decode only: prefill's per-rank buffer is the fixed 8192 (not
+        # concurrency-derived) and its capture batches are tiny, so a perrank*ws
+        # slice there would drop real tokens.
+        if not get_is_extend_in_batch():
+            cap = (
+                dispatch_output.origin_topk_ids.shape[0]
+                * get_moe_expert_parallel_world_size()
+            )
+            hidden_states = hidden_states[:cap]
+            if a1_scale is not None:
+                a1_scale = a1_scale[:cap]
+            topk_ids = topk_ids[:cap]
+            topk_weights = topk_weights[:cap]
     else:
         # DeepEP marks invalid topk slots with idx == -1; AITER cannot accept
         # negative ids, so reroute them to the sink slot at index
