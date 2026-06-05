@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -7,7 +8,10 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import torch
 
 from sglang.srt.distributed import get_moe_expert_parallel_world_size
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -33,6 +37,38 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+
+# Recv-tightening coefficient for the CUDA-graph-captured mori decode trunc cap.
+# The captured path cannot host-sync to read the device recv, so it caps from the
+# host global token count (== origin*ws under MAX_LEN padding). A coefficient < 1
+# tightens that cap toward the actual device recv to recover the TPOT the loose
+# full-global cap leaves on the table (e2e 2026-06-04T16:52Z: recv 120-152 vs cap
+# 256 at conc-64 on the MAIN model -> ~26% regression). The InferenceMINI CI
+# reference used ~0.7*global (floor(conc*0.7)*(MTP+1), ROOT_CAUSE_CLUES s4).
+#
+# DEFAULT IS 1.0 (NO tightening) because 0.7 is NOT recv-safe in general: the
+# EAGLE/NextN DRAFT model runs tiny batches where 0.7*global < the device recv
+# (e2e 2026-06-04T17:40Z, decode_teamA_t26d telemetry: draft global_tokens=40,
+# recv=32, 0.7-cap=28 -> margin -4 OOB), so the captured 0.7 slice drops real
+# draft rows and crashes the mori COMBINE quant path ("Fp8BlockwiseQuant only
+# supports bf16, got fp8_ocp") during the draft worker's cuda-graph capture.
+# Under capture we cannot host-sync to clamp the cap up to recv, so there is no
+# safe way to tighten below the full global count for ALL batch sizes. Keep the
+# correct, fault-free full-global cap by default; the coefficient stays env-
+# overridable for experiments, gated by SGLANG_MORI_RECV_CAP_DEBUG telemetry
+# that flags any forward where the would-be cap drops below the measured recv.
+_MORI_RECV_CAP_COEFF = float(os.environ.get("SGLANG_MORI_RECV_CAP_COEFF", "1.0"))
+
+# Telemetry for the captured-path heuristic above. The captured cap
+# (_MORI_RECV_CAP_COEFF * global tokens) is recv-safe ONLY if the actual device
+# recv stays below it on every replay; under capture we cannot read the device
+# recv to assert that, so an OOB would be silent until it faults. Enable this
+# flag to have the EAGER forwards (which DO read the exact device recv) print
+# recv vs the would-be captured cap, so the 0.7 margin can be confirmed under
+# real traffic BEFORE relying on it under capture. Off by default (the .item()
+# is already paid on the eager path, so the only added cost is the print).
+_MORI_RECV_CAP_DEBUG = os.environ.get("SGLANG_MORI_RECV_CAP_DEBUG", "0") == "1"
 
 
 class AiterQuantType(str, Enum):
@@ -306,26 +342,111 @@ def _pre_permute_deepep_to_aiter(
         )
 
         # Truncate the padded mori dispatch tensors back to this decode forward's
-        # recv upper bound. CI (InferenceMINI server_sglang.sh) sizes the decode
-        # per-rank dispatch buffer as
-        #     perrank = (concurrency / tp) * (MTP + 1)
-        # which at runtime equals this forward's per-rank token count
-        # origin_topk_ids.shape[0] (= bs_per_rank * num_draft_tokens). The recv
-        # upper bound is therefore perrank * ep_size, while mori pads the recv
-        # buffer to the worst case (max_dispatch_tokens_per_rank * ep_size).
-        # Slicing to perrank * ws lets fused_moe permute/sort/GEMM/combine scale
-        # with the live concurrency instead of the padded buffer, so one decode
-        # server serves many concurrencies without a restart. mori dispatch is
-        # tail-padded (real tokens in [0, totalRecvTokenNum)), so dropping the
-        # tail needs no pad-back; expected_m is orthogonal (kernel-tier lookup).
-        # Decode only: prefill's per-rank buffer is the fixed 8192 (not
-        # concurrency-derived) and its capture batches are tiny, so a perrank*ws
-        # slice there would drop real tokens.
+        # recv upper bound so fused_moe permute/sort/GEMM/combine scale with the
+        # live concurrency instead of the worst-case padded buffer
+        # (max_dispatch_tokens_per_rank * ep_size). This lets ONE decode server
+        # serve many concurrencies without a per-concurrency env knob. mori
+        # dispatch is tail-padded (real tokens in [0, totalRecvTokenNum)), so
+        # dropping the tail needs no pad-back; expected_m is orthogonal
+        # (kernel-tier lookup). Decode only: prefill's per-rank buffer is the
+        # fixed 8192 (not concurrency-derived) and its capture batches are tiny,
+        # so truncating there would drop real tokens.
+        #
+        # The ONLY correctness requirement is cap >= the true recv on this rank,
+        # because aiter.fused_moe (moe_sorting / grouped-GEMM / combine) indexes
+        # hidden_states rows in [0, num_recv_tokens_per_expert.sum()). That recv
+        # is a DEVICE ROUTE COUNT routed in from ALL EP ranks; any cap below it
+        # makes fused_moe read rows [cap, recv) that hidden_states[:cap] dropped
+        # -> GPU Memory access fault. Everything beyond that bound is perf only.
+        #
+        # A host-side TOKEN count cannot bound the device ROUTE count here:
+        #   * The local origin*ws only equals the global recv when every rank has
+        #     the same batch. Under DP-attention SUM_LEN padding (eager warmup/
+        #     decode) the per-rank batches are heterogeneous, so a small-origin
+        #     rank's origin*ws underflows the global recv -> fault.
+        #   * sum(get_dp_global_num_tokens()) (the prior global-token fix) fixed
+        #     the heterogeneous-batch case but STILL faulted on-device
+        #     (2026-06-04T16:17Z e2e): for this deployment topk == ws == 8, so
+        #     the global-token cap equals the *uniform-routing* recv exactly
+        #     (margin 0). A rank holding hot experts receives > 1/ws of the
+        #     global_total*topk routes, so its recv exceeds the global-token cap.
+        #   * During PD-disaggregation warmup the DP global-token metadata is not
+        #     populated, so a host-token cap is absent/wrong there too.
+        #
+        # Therefore size the cap from the ACTUAL recv (num_recv_tokens_per_expert
+        # .sum()) -- exact, always OOB-safe, and still shrinks with live
+        # concurrency. Reading it needs a device->host sync, which is illegal
+        # under CUDA-graph capture; but capture uses MAX_LEN padding (uniform per
+        # rank) so the host global-token count there equals recv and bakes a
+        # fixed slice byte-identical to the original origin*ws -> the captured
+        # decode hot path (the benchmarked path) keeps its perf and never syncs.
+        # The eager .item() runs only on warmup / non-graph forwards.
         if not get_is_extend_in_batch():
-            cap = (
-                dispatch_output.origin_topk_ids.shape[0]
-                * get_moe_expert_parallel_world_size()
-            )
+            ws = get_moe_expert_parallel_world_size()
+            buffer_rows = hidden_states.shape[0]
+            if torch.cuda.is_current_stream_capturing():
+                # Capture: a device->host sync (.item()) is illegal, so the cap
+                # must be host-derived. DP attention pads MAX_LEN here so the
+                # per-forward global token count is uniform and host-readable.
+                global_num_tokens = get_dp_global_num_tokens()
+                if global_num_tokens is not None and len(global_num_tokens) == ws:
+                    # Recv-tight captured cap: the full global token count is
+                    # recv-SAFE but ~1.4-1.7x the actual device recv (e2e
+                    # 2026-06-04T16:52Z teamB t5: recv 120-152 vs cap 256 at
+                    # conc-64), so slicing to it leaves fused_moe processing
+                    # excess rows and regresses TPOT. The InferenceMINI CI
+                    # reference used a recv-tight static cap ~0.7*global
+                    # (floor(conc*0.7)*(MTP+1), ROOT_CAUSE_CLUES s4) that hit the
+                    # 7.4/8.7 TPOT targets. RESIDUAL RISK: under capture we cannot
+                    # host-sync to assert cap >= recv, so a replay with
+                    # recv > 0.7*global would OOB silently; 0.7 is CI-validated
+                    # with measured headroom (152 vs 179) but is not a proven
+                    # bound. SGLANG_MORI_RECV_CAP_DEBUG=1 prints the eager recv vs
+                    # this cap to confirm the margin under real traffic.
+                    cap = int(sum(global_num_tokens) * _MORI_RECV_CAP_COEFF)
+                else:
+                    # Global metadata absent under capture (the NextN/EAGLE DRAFT
+                    # worker's cuda-graph capture, or PD-disagg warmup): do NOT
+                    # fall back to the local origin*ws bound. origin*ws under-caps
+                    # the global recv under heterogeneous per-rank batches, and
+                    # truncating the dispatch buffer to that under-cap corrupts
+                    # the mori COMBINE quant path -> the "Fp8BlockwiseQuant only
+                    # supports bf16, got fp8_ocp" crash on the draft worker
+                    # capture (decode_teamA_t26 2026-06-04T17:19Z; Review 7 item
+                    # (a) for the captured path). The full padded buffer is always
+                    # recv-safe, so skip truncation here.
+                    cap = buffer_rows
+            elif num_local_tokens is not None:
+                # Eager (warmup / non-graph decode): the .item() sync is legal,
+                # so use the EXACT device recv -> OOB-safe regardless of routing
+                # imbalance or missing global metadata (fixes PD-warmup too).
+                cap = int(num_local_tokens.sum().item())
+                if _MORI_RECV_CAP_DEBUG:
+                    # Confirm the captured-path 0.7 heuristic is recv-safe under
+                    # real traffic: compare this exact device recv against the cap
+                    # the captured path WOULD bake for the same global token count.
+                    global_num_tokens = get_dp_global_num_tokens()
+                    if global_num_tokens is not None and len(global_num_tokens) == ws:
+                        gt = sum(global_num_tokens)
+                    else:
+                        gt = dispatch_output.origin_topk_ids.shape[0] * ws
+                    would_be_cap = int(gt * _MORI_RECV_CAP_COEFF)
+                    print(
+                        f"[MORI_RECV_CAP] recv={cap} global_tokens={gt} "
+                        f"coeff={_MORI_RECV_CAP_COEFF} would_be_captured_cap="
+                        f"{would_be_cap} margin={would_be_cap - cap} "
+                        f"{'OOB!' if would_be_cap < cap else 'safe'}",
+                        flush=True,
+                    )
+            else:
+                # No recv count available: do not truncate (full buffer is always
+                # recv-safe; truncation is only a perf optimization).
+                cap = buffer_rows
+            cap = min(cap, buffer_rows)
+            # mori dispatch tail-pads all four tensors to the worst-case buffer
+            # (real entries in [0, totalRecvTokenNum)); slice them consistently to
+            # the cap so fused_moe + combine scale with live concurrency. The cap
+            # is recv-safe by construction above, so [0, cap) keeps every real row.
             hidden_states = hidden_states[:cap]
             if a1_scale is not None:
                 a1_scale = a1_scale[:cap]
