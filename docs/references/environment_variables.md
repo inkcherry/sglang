@@ -86,6 +86,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_MORI_QP_PER_TRANSFER` | Number of RDMA Queue Pairs (QPs) used per transfer operation | `1` |
 | `SGLANG_MORI_POST_BATCH_SIZE` | Number of RDMA work requests posted in a single batch to each QP | `-1` |
 | `SGLANG_MORI_NUM_WORKERS` | Number of worker threads in the RDMA executor thread pool | `1` |
+| `SGLANG_MORI_CAP_RATIO` | Scales the fixed Mori EP dispatch window used during CUDA graph capture | `1` |
+
 
 ## DSA Backend Configuration (For DeepSeek V3.2)
 

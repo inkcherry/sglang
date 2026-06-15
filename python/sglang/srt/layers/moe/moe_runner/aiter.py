@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import functools
 import inspect
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.srt.distributed import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -18,7 +20,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_bool_env_var, print_warning_once, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -368,10 +371,20 @@ def _pre_permute_deepep_to_aiter(
             dispatch_output.origin_topk_weights
         )
         if torch.cuda.is_current_stream_capturing():
+            server_args = get_global_server_args()
+            if not require_mlp_tp_gather(server_args):
+                print_warning_once(
+                    "The Mori EP dispatch cap assumes the same CUDA graph batch size "
+                    "across ranks, which may be invalid when MLP TP gather is not "
+                    "required or DP LM head is enabled."
+                )
+
+            SGLANG_MORI_CAP_RATIO = float(os.environ.get("SGLANG_MORI_CAP_RATIO", 1))
             cap = (
                 dispatch_output.origin_topk_ids.shape[0]
                 * get_moe_expert_parallel_world_size()
-            )
+            ) * SGLANG_MORI_CAP_RATIO
+            cap = int(cap)
             cap = cap if cap > 0 else hidden_states.shape[0]
 
             hidden_states = hidden_states[:cap]
