@@ -300,7 +300,12 @@ def _apply_mock_forward_overrides(server_args: ServerArgs) -> None:
         also pulls in a CUDA-only JIT kernel that crashes on ROCm).
 
     Must be called BEFORE any code reads server_args fields, since those
-    reads cache derived state (e.g. self.enable_overlap on line ~331).
+    reads cache derived state (e.g. self.enable_overlap is derived from
+    disable_overlap_schedule shortly after this call).
+
+    Incompatible fields are accessed directly (not via getattr-with-default):
+    they all exist on ServerArgs, and a direct access fails loudly if a
+    field is ever renamed, instead of silently defaulting to "compatible".
 
     See docs/dev/mock_forward.md.
     """
@@ -316,15 +321,12 @@ def _apply_mock_forward_overrides(server_args: ServerArgs) -> None:
     # each DP rank is an independent scheduler+worker process with its own
     # model copy and KV pool, so cross-rank dependencies are minimal; the
     # few that exist (e.g. prepare_mlp_sync_batch under --enable-dp-attention)
-    # are bypassed identically on every rank.
-    if (
-        getattr(server_args, "disaggregation_mode", "null")
-        and server_args.disaggregation_mode != "null"
-    ):
+    # run identically on every rank and do not depend on forward output.
+    if server_args.disaggregation_mode != "null":
         incompat.append(f"disaggregation_mode={server_args.disaggregation_mode}")
-    if getattr(server_args, "enable_pdmux", False):
+    if server_args.enable_pdmux:
         incompat.append("enable_pdmux")
-    if getattr(server_args, "pp_size", 1) > 1:
+    if server_args.pp_size > 1:
         # Non-last PP rank in tp_worker.forward_batch_generation returns
         # GenerationBatchResult(pp_hidden_states_proxy_tensors=...); the
         # mock cut point does not produce these proxy tensors, so PP
@@ -333,7 +335,7 @@ def _apply_mock_forward_overrides(server_args: ServerArgs) -> None:
             f"pp_size={server_args.pp_size} (PP non-last ranks need "
             "pp_hidden_states_proxy_tensors)"
         )
-    if getattr(server_args, "is_embedding", False):
+    if server_args.is_embedding:
         # Embedding/reward models go through tp_worker.forward_batch_embedding,
         # which is outside our cut point: mock would silently NOT apply and
         # the server would still try a real forward.
@@ -361,6 +363,54 @@ def _apply_mock_forward_overrides(server_args: ServerArgs) -> None:
             "(overlap only hides GPU forward time, which is zero under mock; "
             "also avoids the CUDA-only resolve_future_token_ids JIT kernel)."
         )
+
+
+def _mock_forward_logprob_reject_reason(
+    recv_req: "TokenizedGenerateReqInput",
+) -> Optional[str]:
+    """Return an abort message if a request needs logprob features the mock
+    forward v1 cannot serve, else None.
+
+    Under mock, only basic output logprob works (mock_forward_batch_generation
+    populates next_token_logprobs). top_logprobs, input logprobs, and
+    token_ids_logprob all hit None-subscript / assertion crashes deep in the
+    logprob result processors (the token_ids_logprob output path in
+    _apply_decode_logprobs has no None guard, unlike its prefill counterpart),
+    so we reject them up front with a clear message — consistent with the
+    fail-fast handling of spec / PP / embedding — instead of leaking a raw
+    NoneType crash.
+
+    IMPORTANT: read recv_req.logprob_start_len (the user's original request),
+    NOT req.logprob_start_len. handle_generate_request rewrites
+    req.logprob_start_len to len(input) for default return_logprob requests
+    (which actually means "skip input logprob", num_input_logprobs == 0, no
+    crash); checking the rewritten value would false-reject every basic
+    output-logprob request and break the "basic logprob works" guarantee.
+    """
+    if not envs.SGLANG_MOCK_FORWARD.get():
+        return None
+    if not recv_req.return_logprob:
+        return None
+    # top_logprobs_num > 0       -> top_logprobs path (None subscript crash)
+    # logprob_start_len >= 0     -> user explicitly asked for input logprobs
+    #   (conservative: == len(input) wouldn't actually crash, but a user
+    #    passing an explicit start_len is doing input-logprob work we don't
+    #    support, so rejecting is acceptable in a fail-fast tool)
+    # token_ids_logprob not None -> token_ids_logprob path; per-req value is
+    #   None when unset, a list when requested (see GenerateReqInput
+    #   normalization). The decode output path subscripts it without a None
+    #   guard, so it must be rejected too.
+    if (
+        recv_req.top_logprobs_num > 0
+        or recv_req.logprob_start_len >= 0
+        or recv_req.token_ids_logprob is not None
+    ):
+        return (
+            "SGLANG_MOCK_FORWARD v1 does not support top_logprobs, input "
+            "logprobs, or token_ids_logprob (only basic output logprob). "
+            "See docs/dev/mock_forward.md."
+        )
+    return None
 
 
 class Scheduler(
@@ -2090,6 +2140,15 @@ class Scheduler(
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        # Reject logprob features the mock forward cannot serve BEFORE the
+        # logprob_start_len rewrite below (which would mask the user's
+        # original intent). No-op when mock is off.
+        mock_logprob_reject = _mock_forward_logprob_reject_reason(recv_req)
+        if mock_logprob_reject is not None:
+            req.set_finish_with_abort(mock_logprob_reject)
             self._add_request_to_queue(req)
             return
 

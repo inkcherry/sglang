@@ -1273,6 +1273,16 @@ class Req(ReqDllmMixin):
         if self.finished():
             return
 
+        # Honor abort BEFORE the mock branch: abort of a running request is
+        # driven by `to_finish` (set by /abort, running-timeout, session
+        # abort, set_finish_with_abort). Abort/timeout is part of the
+        # scheduler path that mock mode is meant to exercise, so mock must
+        # not swallow it.
+        if self.to_finish:
+            self.finished_reason = self.to_finish
+            self.to_finish = None
+            return
+
         # Mock forward: finish purely by output length, bypassing all EOS /
         # stop_str / grammar / vocab-boundary checks. fake next_token_ids are
         # a fixed constant and would either never trigger natural stops or
@@ -1285,11 +1295,6 @@ class Req(ReqDllmMixin):
             if len(self.output_ids) >= target:
                 self.finished_reason = FINISH_LENGTH(length=target)
                 self.finished_len = target
-            return
-
-        if self.to_finish:
-            self.finished_reason = self.to_finish
-            self.to_finish = None
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:

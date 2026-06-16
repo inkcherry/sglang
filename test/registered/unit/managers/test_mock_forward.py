@@ -6,16 +6,21 @@ Covers:
   - scheduler._apply_mock_forward_overrides validation matrix:
       * no-op when mock is off
       * raises NotImplementedError on incompatible features
-        (speculative_algorithm, disaggregation_mode, enable_pdmux)
+        (speculative_algorithm, disaggregation_mode, enable_pdmux,
+        pp_size > 1, is_embedding)
       * collects all incompat reasons into one raise message
       * allows tp_size > 1 and dp_size > 1 (spike-validated)
       * force-disables cuda_graph and overlap_schedule with a warning
+  - scheduler._mock_forward_logprob_reject_reason:
+      * rejects top_logprobs / input logprobs, but does NOT false-reject
+        basic output logprob (the recv_req vs req.logprob_start_len trap)
   - entrypoints.http_server._print_mock_forward_banner_if_enabled:
       * no-op when off, prints frame + anti-patterns when on
   - managers.mock_forward.mock_forward_batch_generation:
       * fake_logits shape/dtype, next_token_ids shape/dtype/value,
-        can_run_cuda_graph = False
+        next_token_logprobs populated, can_run_cuda_graph = False
   - managers.schedule_batch.Req.update_finish_state mock branch:
+      * honors to_finish (abort) before the mock length check
       * finishes by output length only, respects max_new_tokens,
       * bypasses EOS/grammar/stop_str checks
 """
@@ -294,12 +299,15 @@ class TestUpdateFinishStateMockBranch(CustomTestCase):
         self._call = Req.update_finish_state
         self.FINISH_LENGTH = FINISH_LENGTH
 
-    def _fake_req(self, output_ids_len, max_new_tokens=128):
-        # Mock branch only reads .finished(), .output_ids,
+    def _fake_req(self, output_ids_len, max_new_tokens=128, to_finish=None):
+        # Mock branch reads .finished(), .to_finish, .output_ids,
         # .sampling_params.max_new_tokens; it sets .finished_reason and
-        # .finished_len, then returns. Other Req attributes are untouched.
+        # .finished_len, then returns. to_finish defaults to None (a bare
+        # MagicMock attribute would be truthy and wrongly take the abort
+        # branch, which now runs before the mock branch).
         req = MagicMock()
         req.finished = lambda: False
+        req.to_finish = to_finish
         req.output_ids = list(range(output_ids_len))
         req.sampling_params.max_new_tokens = max_new_tokens
         req.finished_reason = None
@@ -351,6 +359,90 @@ class TestUpdateFinishStateMockBranch(CustomTestCase):
             # exception is raised.
             self._call(req)
             self.assertIsNone(req.finished_reason)
+
+    def test_abort_honored_before_mock_branch(self):
+        # A running request aborted via to_finish must finish with that
+        # reason (FINISH_ABORT), NOT wait for the mock output-length target.
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        with envs.SGLANG_MOCK_FORWARD.override(True), envs.SGLANG_MOCK_FORWARD_OUTPUT_LEN.override(
+            32
+        ):
+            abort = FINISH_ABORT()
+            # output well below the mock target: without the to_finish
+            # priority fix this would NOT finish at all.
+            req = self._fake_req(output_ids_len=3, max_new_tokens=128, to_finish=abort)
+            self._call(req)
+            self.assertIs(req.finished_reason, abort)
+            self.assertIsNone(req.to_finish)
+
+
+class TestMockForwardLogprobReject(CustomTestCase):
+    """scheduler._mock_forward_logprob_reject_reason — guards the
+    top_logprobs / input-logprob crash paths and, critically, must NOT
+    false-reject basic output logprob."""
+
+    @classmethod
+    def setUpClass(cls):
+        from sglang.srt.managers.scheduler import (
+            _mock_forward_logprob_reject_reason,
+        )
+
+        cls.fn = staticmethod(_mock_forward_logprob_reject_reason)
+
+    def _recv_req(self, **overrides):
+        defaults = dict(
+            return_logprob=False,
+            top_logprobs_num=0,
+            logprob_start_len=-1,
+            token_ids_logprob=None,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_noop_when_mock_off(self):
+        rr = self._recv_req(return_logprob=True, top_logprobs_num=5)
+        self.assertIsNone(self.fn(rr))
+
+    def test_noop_when_no_logprob(self):
+        with envs.SGLANG_MOCK_FORWARD.override(True):
+            rr = self._recv_req(return_logprob=False, top_logprobs_num=5)
+            self.assertIsNone(self.fn(rr))
+
+    def test_basic_output_logprob_not_rejected(self):
+        # THE TRAP GUARD: default return_logprob=True with no top_logprobs
+        # and no explicit logprob_start_len (recv_req value still -1) must
+        # be allowed. Uses recv_req.logprob_start_len (-1), NOT the value
+        # handle_generate_request later rewrites to len(input).
+        with envs.SGLANG_MOCK_FORWARD.override(True):
+            rr = self._recv_req(
+                return_logprob=True, top_logprobs_num=0, logprob_start_len=-1
+            )
+            self.assertIsNone(self.fn(rr))
+
+    def test_reject_top_logprobs(self):
+        with envs.SGLANG_MOCK_FORWARD.override(True):
+            rr = self._recv_req(return_logprob=True, top_logprobs_num=3)
+            reason = self.fn(rr)
+            self.assertIsNotNone(reason)
+            self.assertIn("top_logprobs", reason)
+
+    def test_reject_input_logprobs(self):
+        with envs.SGLANG_MOCK_FORWARD.override(True):
+            rr = self._recv_req(return_logprob=True, logprob_start_len=0)
+            reason = self.fn(rr)
+            self.assertIsNotNone(reason)
+            self.assertIn("input logprobs", reason)
+
+    def test_reject_token_ids_logprob(self):
+        # token_ids_logprob has the same None-subscript crash as top_logprobs
+        # (decode output path, no None guard). Must be rejected even with
+        # top_logprobs_num=0 and no explicit logprob_start_len.
+        with envs.SGLANG_MOCK_FORWARD.override(True):
+            rr = self._recv_req(return_logprob=True, token_ids_logprob=[42, 7])
+            reason = self.fn(rr)
+            self.assertIsNotNone(reason)
+            self.assertIn("token_ids_logprob", reason)
 
 
 if __name__ == "__main__":

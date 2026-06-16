@@ -48,12 +48,17 @@ def mock_forward_batch_generation(
     # Fake logits: zeros are fine because we also bypass the real sampler.
     # Shape (bs, vocab_size) is what downstream readers expect.
     fake_logits = torch.zeros((bs, vocab_size), device=device, dtype=dtype)
-    # Fake logprobs: populated only so requests with return_logprob=True
+    # Fake logprobs: populated so requests with basic output logprob
+    # (return_logprob=True, top_logprobs_num=0, no explicit logprob_start_len)
     # do not crash on None.tolist() / None[i] in batch_result_processor /
-    # logprob_result_processor. Values are meaningless under mock; only
-    # shape and dtype matter. top_logprobs and token_ids_logprobs (the
-    # list-valued fields) are left as defaults; requests using those
-    # extras may still encounter empty-list behavior downstream.
+    # logprob_result_processor. Values are meaningless under mock; only shape
+    # and dtype matter.
+    #
+    # NOTE: top_logprobs and input logprobs are NOT populated here. Those
+    # paths are rejected up front in scheduler.handle_generate_request
+    # (_mock_forward_logprob_reject_reason), so they never reach this output.
+    # Filling shape-valid placeholders for them would require replicating the
+    # input-logprob length bookkeeping, which is not worth it for fake data.
     fake_logprobs = torch.zeros((bs,), device=device, dtype=torch.float32)
     logits_output = LogitsProcessorOutput(
         next_token_logits=fake_logits,

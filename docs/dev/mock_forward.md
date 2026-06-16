@@ -71,7 +71,26 @@ Auto-force-off (with a `WARNING` log line):
 | Stream output (SSE chunks) | ✅ | Real detokenize / IPC |
 | Token throughput, latency | ❌ | No GPU work; numbers are meaningless |
 | Output text content | ❌ | Pre-determined fake token |
-| `return_logprob` values | ❌ | Populated with zeros to avoid crashes |
+| Basic output logprob (`return_logprob`) | runs, value meaningless | `next_token_logprobs` is populated with zeros |
+| `top_logprobs` / input logprobs / `token_ids_logprob` | rejected | Request fails fast with a clear "v1 unsupported" abort (not a crash); see below |
+
+### Logprob support detail
+
+Under mock, **only basic output logprob works** (`return_logprob=true`,
+`top_logprobs_num=0`, no explicit `logprob_start_len`, no
+`token_ids_logprob`). The values are zeros and carry no meaning — useful
+only to keep the logprob CPU path from crashing.
+
+Requests that ask for any of:
+
+- **`top_logprobs`** (`top_logprobs_num > 0`)
+- **input logprobs** (explicit `logprob_start_len >= 0`)
+- **`token_ids_logprob`** (specific token-id logprobs)
+
+are rejected at admission with a clear abort (`SGLANG_MOCK_FORWARD v1 does
+not support top_logprobs, input logprobs, or token_ids_logprob ...`),
+rather than crashing deep in the logprob result processors. This mirrors
+the fail-fast handling of speculative decoding / PP / embedding models.
 
 ## TODO (follow-up)
 
