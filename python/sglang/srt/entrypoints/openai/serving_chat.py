@@ -127,7 +127,17 @@ def normalize_assistant_tool_call_arguments(message: Dict[str, Any]) -> None:
         if not isinstance(function, dict):
             continue
         if "arguments" in function and isinstance(function["arguments"], str):
-            function["arguments"] = parse_tool_call_arguments(function["arguments"])
+            try:
+                function["arguments"] = parse_tool_call_arguments(
+                    function["arguments"]
+                )
+            except ValueError:
+                # A prior-turn assistant tool call may carry arguments that are
+                # not valid JSON (e.g. produced by an upstream model or client).
+                # A malformed history turn must not abort current-turn
+                # generation, so keep the raw string and let the chat template
+                # render it as-is.
+                pass
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
