@@ -70,7 +70,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
+/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky` /
+/// `fused_score`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -95,6 +96,14 @@ pub enum PolicyKind {
     /// `ModelConfig::sticky`.
     #[value(name = "sticky")]
     Sticky,
+    /// Pluggable Filter→Score→Select policy composing weighted scorers into a
+    /// fused cache×load decision. Default scorers: `PrefixCacheScorer`
+    /// (primary) + `LoadScorer` (lighter corrective), argmax selection. Like
+    /// `cache_aware_zmq` it reads the KV-event tree + tokenizer + block size,
+    /// so a tokenizer must be loaded for the cache term to fire (it degrades
+    /// to load-only otherwise).
+    #[value(name = "fused_score")]
+    FusedScore,
 }
 
 #[derive(Debug, Clone)]

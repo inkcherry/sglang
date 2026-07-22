@@ -10,6 +10,10 @@ use crate::policies::{
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
+    scoring::{
+        load_scorer::LoadScorer, pickers::ArgmaxSelector,
+        prefix_cache_scorer::PrefixCacheScorer, ScoredPolicy,
+    },
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
@@ -28,7 +32,7 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq | PolicyKind::Sticky => {
+        PolicyKind::CacheAwareZmq | PolicyKind::Sticky | PolicyKind::FusedScore => {
             unreachable!("sticky fallback is validated to be dependency-free in Cli::into_config")
         }
     }
@@ -74,6 +78,29 @@ pub fn build_policy(
             ))
         }
         PolicyKind::Sticky => build_sticky(model),
+        PolicyKind::FusedScore => {
+            // Default fused pipeline: continuous prefix-cache depth is the
+            // primary term (weight 1.0), with normalized load as a lighter
+            // corrective term (weight 0.7) that can still flip the decision
+            // when the best-cached worker is saturated. Argmax selection;
+            // swap in `SoftmaxSelector` for anti-herd once wired to
+            // per-model config.
+            Arc::new(
+                ScoredPolicy::new(
+                    vec![],
+                    vec![
+                        Box::new(PrefixCacheScorer::new(
+                            1.0,
+                            tree,
+                            tokenizers,
+                            block_size_oracle,
+                        )),
+                        Box::new(LoadScorer::new(0.7)),
+                    ],
+                    Box::new(ArgmaxSelector::new()),
+                ),
+            )
+        }
     }
 }
 
@@ -106,6 +133,23 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
                 Duration::from_secs(s.idle_secs),
                 Duration::from_secs(s.eviction_interval_secs),
                 build_sticky_fallback(s.fallback_policy),
+            ))
+        }
+        PolicyKind::FusedScore => {
+            // Empty tree + tokenizer + fresh oracle → the prefix term is
+            // inert (neutral), so the test policy degrades to load-only.
+            Arc::new(ScoredPolicy::new(
+                vec![],
+                vec![
+                    Box::new(PrefixCacheScorer::new(
+                        1.0,
+                        Arc::new(HashTree::new()),
+                        Arc::new(TokenizerRegistry::default()),
+                        BlockSizeOracle::new(),
+                    )),
+                    Box::new(LoadScorer::new(0.7)),
+                ],
+                Box::new(ArgmaxSelector::new()),
             ))
         }
     }
@@ -190,6 +234,21 @@ mod tests {
         let _ = build_policy_kind_only(PolicyKind::LoadBased);
         let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
         let _ = build_policy_kind_only(PolicyKind::Sticky);
+        let _ = build_policy_kind_only(PolicyKind::FusedScore);
+    }
+
+    #[test]
+    fn fused_score_builds_via_factory() {
+        let cfg = cfg_with_model("modelF", PolicyKind::FusedScore);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let p = reg.get(&ModelId("modelF".into())).unwrap();
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("ScoredPolicy"),
+            "expected ScoredPolicy debug repr, got: {dbg}",
+        );
     }
 
     #[test]
