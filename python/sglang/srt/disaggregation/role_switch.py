@@ -121,11 +121,10 @@ def reconcile_role_config(
 ) -> None:
     """Re-derive the role-dependent runtime config and rebuild the a2a buffers.
 
-    Split into a pure derive, then the one fallible step, then infallible
-    writes. The a2a buffer must be sized from the SETTLED cap and chunk size,
-    or it gets sized for the role being left; putting every write after the
-    resize is what makes a failed flip leave nothing half-applied. The prefix
-    cache needs no step: its class is operator config, not role-derived.
+    The a2a buffer must be sized from the SETTLED cap and chunk size, or it
+    gets sized for the role being left; putting every write after the resize
+    is what makes a failed flip leave nothing half-applied. The prefix cache
+    needs no step: its class is operator config, not role-derived.
     """
     from sglang.srt.layers.moe.token_dispatcher.moriep import (
         MoriA2AGroupDead,
