@@ -30,6 +30,36 @@ class TestPdRoleSwitchServerArg(unittest.TestCase):
         self.assertTrue(on.enable_pd_role_switch)
 
 
+def _make_scheduler(mode, *, enable=True, idle=True):
+    s = Scheduler.__new__(Scheduler)
+    s.disaggregation_mode = mode
+    sa = SimpleNamespace(
+        enable_pd_role_switch=enable,
+        disaggregation_mode=mode.value,
+    )
+    # Mirror the real ServerArgs mutation entry the flip path calls.
+    sa.override = lambda source, **fields: sa.__dict__.update(fields)
+    s.server_args = sa
+    s.is_fully_idle = MagicMock(return_value=idle)
+    s._teardown_disaggregation = MagicMock()
+    s.init_disaggregation = MagicMock()
+    s._event_loop_should_restart = False
+    s._pd_role_switch_in_progress = False
+    s._pd_role_switch_unhealthy = False
+    s.tp_worker = MagicMock()
+    s.tp_worker.get_decode_cuda_graph_bs.return_value = [64, 128, 256]
+    sa.chunked_prefill_size = 8192
+    sa.max_prefill_tokens = 16384
+    sa.speculative_num_draft_tokens = None
+    s.max_running_requests = 128
+    s._pd_role_switch_launch_cap = 128
+    s.chunked_prefill_size = 8192
+    s.enable_dynamic_chunking = False
+    for holder, _ in role_switch._MAX_RUNNING_REQUESTS_HOLDERS:
+        setattr(s, holder, SimpleNamespace(max_running_requests=128))
+    return s
+
+
 class TestHandlePdRoleSwitch(unittest.TestCase):
     """Cover the control-plane contract of Scheduler.handle_pd_role_switch.
 
@@ -38,34 +68,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     orchestration order without standing up a model.
     """
 
-    def _scheduler(self, mode, *, enable=True, idle=True):
-        s = Scheduler.__new__(Scheduler)
-        s.disaggregation_mode = mode
-        sa = SimpleNamespace(
-            enable_pd_role_switch=enable,
-            disaggregation_mode=mode.value,
-        )
-        # Mirror the real ServerArgs mutation entry the flip path calls.
-        sa.override = lambda source, **fields: sa.__dict__.update(fields)
-        s.server_args = sa
-        s.is_fully_idle = MagicMock(return_value=idle)
-        s._teardown_disaggregation = MagicMock()
-        s.init_disaggregation = MagicMock()
-        s._event_loop_should_restart = False
-        s._pd_role_switch_in_progress = False
-        s._pd_role_switch_unhealthy = False
-        s.tp_worker = MagicMock()
-        s.tp_worker.get_decode_cuda_graph_bs.return_value = [64, 128, 256]
-        sa.chunked_prefill_size = 8192
-        sa.max_prefill_tokens = 16384
-        sa.speculative_num_draft_tokens = None
-        s.max_running_requests = 128
-        s._pd_role_switch_launch_cap = 128
-        s.chunked_prefill_size = 8192
-        s.enable_dynamic_chunking = False
-        for holder, _ in role_switch._MAX_RUNNING_REQUESTS_HOLDERS:
-            setattr(s, holder, SimpleNamespace(max_running_requests=128))
-        return s
+    _scheduler = staticmethod(_make_scheduler)
 
     def test_rejected_when_flag_disabled(self):
         s = self._scheduler(DisaggregationMode.PREFILL, enable=False)
@@ -212,25 +215,22 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_disaggregation.assert_not_called()
 
 
-class TestRoleConfigReconcile(TestHandlePdRoleSwitch):
+class TestRoleConfigReconcile(unittest.TestCase):
     """The reconcile that re-derives the role-dependent config and resizes the
-    mori a2a buffer. Inherits the scheduler fixture from the handler tests."""
+    mori a2a buffer, driven through the real handler."""
 
-    def _flip(self, mode, new_role, **req):
-        s = self._scheduler(mode)
-        with patch.object(moriep, "rebuild_mori_dispatch_buffers") as resize:
-            out = Scheduler.handle_pd_role_switch(
-                s, PdRoleSwitchReqInput(new_role=new_role, **req)
-            )
-        return s, out, resize
+    _scheduler = staticmethod(_make_scheduler)
 
     def test_a2a_sized_from_settled_chunk_not_the_current_one(self):
         """Constraint 2: settle the cap and chunk size first, then size the a2a
         buffer from the settled values. Sizing from the live scheduler fields
         builds the buffer for the role being LEFT."""
-        s, out, resize = self._flip(
-            DisaggregationMode.DECODE, "prefill", chunked_prefill_size=2048
-        )
+        s = self._scheduler(DisaggregationMode.DECODE)
+        with patch.object(moriep, "rebuild_mori_dispatch_buffers") as resize:
+            out = Scheduler.handle_pd_role_switch(
+                s,
+                PdRoleSwitchReqInput(new_role="prefill", chunked_prefill_size=2048),
+            )
         self.assertTrue(out.success)
         resize.assert_called_once_with(2048, "prefill")
         self.assertEqual(s.chunked_prefill_size, 2048)
