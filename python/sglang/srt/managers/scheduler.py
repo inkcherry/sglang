@@ -494,17 +494,13 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_kv_cache_and_memory_pool()
-        # The class a flip to prefill restores. Not captured inside the builder
-        # above: the reconcile calls it again per role and would overwrite it.
-        # A decode launch is forced to chunk cache before the scheduler sees the
-        # flag, so it holds no prefill answer -- and the operator could not have
-        # expressed one, the force ignores --disable-radix-cache too. Fall back
-        # to the prefill default; the forced value serves prefill with no prefix
-        # reuse at all.
+        # Not captured inside the builder above: the reconcile calls it again
+        # per role and would overwrite the launch value.
         self._pd_role_switch_launch_disable_radix_cache = (
-            False
-            if self.server_args.disaggregation_mode == "decode"
-            else self.disable_radix_cache
+            role_switch.launch_prefill_cache_class(
+                disaggregation_mode=self.server_args.disaggregation_mode,
+                disable_radix_cache=self.disable_radix_cache,
+            )
         )
 
         if _is_npu and is_deepseek_v4(

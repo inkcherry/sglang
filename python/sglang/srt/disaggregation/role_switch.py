@@ -141,6 +141,19 @@ class RoleTargets(msgspec.Struct, frozen=True):
     disable_radix_cache: bool
 
 
+def launch_prefill_cache_class(
+    *, disaggregation_mode: str, disable_radix_cache: bool
+) -> bool:
+    """The prefix-cache class a flip to prefill restores, settled at launch.
+
+    A decode launch has been forced to chunk cache before the scheduler reads
+    the flag, so it holds no prefill answer -- and the operator could not have
+    given one, the forcing ignores `--disable-radix-cache` as well. Replaying it
+    would serve prefill with no prefix reuse at all, so use the prefill default.
+    """
+    return False if disaggregation_mode == "decode" else disable_radix_cache
+
+
 def reconcile_role_config(
     scheduler: Scheduler, new_role: str, recv_req: PdRoleSwitchReqInput
 ) -> None:
