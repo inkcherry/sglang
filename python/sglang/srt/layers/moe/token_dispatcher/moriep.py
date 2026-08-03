@@ -365,9 +365,8 @@ class _LiveOp:
     op: object
     group: object
     rank: int
-    # Tracked here rather than read back off the op: after a failed resize the
-    # op's buffer pointers may be freed, and reading them through pybind
-    # segfaults the rank before any error can cross.
+    # Tracked here, not read back off the op: a failed resize may already have
+    # freed the buffers, and reading them through pybind segfaults the rank.
     capacity: int
 
 
@@ -428,9 +427,9 @@ def rebuild_mori_dispatch_buffers(
         )
     old = _LIVE_OPS[0].capacity
     for live in _LIVE_OPS:
-        # mori reduces the resize outcome on a CPU tensor. The default PG is
-        # nccl, which raises there -- after the old buffers are freed and
-        # before the op refreshes its handles, leaving dangling pointers.
+        # Must be the shmem group: mori reduces the outcome on a CPU tensor and
+        # the default PG is nccl, which raises after the free, before the
+        # handles refresh -- leaving the op pointing at released memory.
         live.op.reconfigure(agreed, group=live.group.cpu_group)
         live.capacity = agreed
     logger.info(
