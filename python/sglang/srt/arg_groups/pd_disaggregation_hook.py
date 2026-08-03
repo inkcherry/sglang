@@ -127,41 +127,38 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
 
     view = resolved_view(server_args)
-    # Built for the launch role only, and a flip neither rebuilds nor tears them
-    # down, so the knob would silently stop applying.
-    offload = view.disaggregation_decode_enable_offload_kvcache
-    delayer = view.enable_prefill_delayer
-    unsupported = [
-        item
-        for present, item in (
-            (view.enable_dp_attention, "DP attention (--enable-dp-attention)"),
-            (view.ep_size > 1, f"expert parallelism (--ep-size {view.ep_size})"),
-            (
-                view.moe_a2a_backend != "none",
-                f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})",
-            ),
-            (view.pp_size > 1, f"pipeline parallelism (--pp-size {view.pp_size})"),
-            (view.dp_size > 1, f"data parallelism (--dp-size {view.dp_size})"),
-            (
-                offload,
-                "decode KV offload " "(--disaggregation-decode-enable-offload-kvcache)",
-            ),
-            (delayer, "the prefill delayer (--enable-prefill-delayer)"),
-        )
-        if present
-    ]
+    # (present, waivable, item). Only expert parallelism over the mori a2a is
+    # waivable; the rest build per-role state a flip never rebuilds, so the knob
+    # would silently stop applying. Deriving the waiver from this same table is
+    # what stops a new row from being rejected but not blocking the waiver.
+    checks = (
+        (view.enable_dp_attention, False, "DP attention (--enable-dp-attention)"),
+        (view.ep_size > 1, True, f"expert parallelism (--ep-size {view.ep_size})"),
+        (
+            view.moe_a2a_backend != "none",
+            view.moe_a2a_backend == "mori",
+            f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})",
+        ),
+        (view.pp_size > 1, False, f"pipeline parallelism (--pp-size {view.pp_size})"),
+        (view.dp_size > 1, False, f"data parallelism (--dp-size {view.dp_size})"),
+        (
+            view.disaggregation_decode_enable_offload_kvcache,
+            False,
+            "decode KV offload (--disaggregation-decode-enable-offload-kvcache)",
+        ),
+        (
+            view.enable_prefill_delayer,
+            False,
+            "the prefill delayer (--enable-prefill-delayer)",
+        ),
+    )
+    unsupported = [item for present, _, item in checks if present]
 
     # The gate waives expert parallelism and the mori a2a together and only
     # together — anything else present keeps the whole configuration rejected.
     gate = server_args.enable_pd_role_switch_experimental_moe
     ep_over_mori = view.ep_size > 1 and view.moe_a2a_backend == "mori"
-    others = (
-        view.enable_dp_attention
-        or view.pp_size > 1
-        or view.dp_size > 1
-        or offload
-        or delayer
-    )
+    others = any(present and not waivable for present, waivable, _ in checks)
     if gate and ep_over_mori and not others:
         logger.warning(
             "EXPERIMENTAL: PD role switch with expert parallelism "
