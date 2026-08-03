@@ -379,6 +379,11 @@ class MoriA2AResizeError(RuntimeError):
     """The EP group could not agree a new a2a capacity, or refused it."""
 
 
+class MoriA2AGroupDead(MoriA2AResizeError):
+    """At least one rank lost its buffers, so the OLD role cannot dispatch
+    either. Unlike every other resize failure this is not recoverable."""
+
+
 def _agree_capacity(target: Optional[int], group) -> Optional[int]:
     """Reduce every rank's proposed per-rank capacity to one group verdict.
 
@@ -425,12 +430,17 @@ def rebuild_mori_dispatch_buffers(
             f"was launched with SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK={ceiling}; "
             "launch flip-capable instances at the larger of the two roles"
         )
+    from mori.ops.dispatch_combine import ResizeFatal
+
     old = _LIVE_OPS[0].capacity
     for live in _LIVE_OPS:
-        # Must be the shmem group: mori reduces the outcome on a CPU tensor and
-        # the default PG is nccl, which raises after the free, before the
-        # handles refresh -- leaving the op pointing at released memory.
-        live.op.reconfigure(agreed, group=live.group.cpu_group)
+        try:
+            # Must be the shmem group: mori reduces the outcome on a CPU tensor
+            # and the default PG is nccl, which raises after the free, before
+            # the handles refresh -- leaving the op pointing at released memory.
+            live.op.reconfigure(agreed, group=live.group.cpu_group)
+        except ResizeFatal as e:
+            raise MoriA2AGroupDead(e) from e
         live.capacity = agreed
     logger.info(
         "[pd-role-switch] a2a capacity %d -> %d rank=%d role=%s",
