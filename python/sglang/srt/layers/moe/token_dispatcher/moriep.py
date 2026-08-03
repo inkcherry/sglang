@@ -5,8 +5,6 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
-import msgspec
-
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
     get_global_expert_distribution_recorder,
@@ -362,7 +360,8 @@ def init_mori_op(
     return mori_op
 
 
-class _LiveOp(msgspec.Struct):
+@dataclass
+class _LiveOp:
     op: object
     group: object
     rank: int
@@ -429,7 +428,10 @@ def rebuild_mori_dispatch_buffers(
         )
     old = _LIVE_OPS[0].capacity
     for live in _LIVE_OPS:
-        live.op.reconfigure(agreed)
+        # mori reduces the resize outcome on a CPU tensor. The default PG is
+        # nccl, which raises there -- after the old buffers are freed and
+        # before the op refreshes its handles, leaving dangling pointers.
+        live.op.reconfigure(agreed, group=live.group.cpu_group)
         live.capacity = agreed
     logger.info(
         "[pd-role-switch] a2a capacity %d -> %d rank=%d role=%s",
