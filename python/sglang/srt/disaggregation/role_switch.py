@@ -78,8 +78,8 @@ def handle_pd_role_switch(
             scheduler.server_args.override(
                 "role_switch.flip", disaggregation_mode=new_role
             )
-            # Two stores, both read: init_disaggregation and the scheduling
-            # policy read the bag, so without this the rebuild sees the old role.
+            # server_args stays the pristine launch record; init_disaggregation and
+            # the scheduling policy rebuild from the bag, so both stores are written.
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
         except Exception as e:
@@ -152,7 +152,6 @@ def _derive_targets(
         recv_req.max_running_requests or scheduler._pd_role_switch_launch_cap,
         scheduler._pd_role_switch_launch_cap,
     )
-    # Not server_args: it stays the pristine launch record across flips.
     chunk = recv_req.chunked_prefill_size or get_schedule().chunked_prefill_size
     if new_role == "prefill":
         # A dynamic chunker may predict a bigger chunk; size to its ceiling.
@@ -201,8 +200,7 @@ def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
         scheduler.load_inquirer, max_running_requests=targets.max_running_requests
     )
     scheduler.kv_events_publisher.max_running_requests = targets.max_running_requests
-    # The bag is the source of truth (the per-step chunk truncation reads it);
-    # the scheduler field is a snapshot, normalized as it is at startup.
+    # The scheduler field is a snapshot of the bag, normalized as it is at startup.
     chunk = targets.chunked_prefill_size
     get_context().override("pd_role_switch.reconcile", chunked_prefill_size=chunk)
     scheduler.chunked_prefill_size = chunk if chunk and chunk > 0 else None
