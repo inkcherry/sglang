@@ -187,6 +187,20 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # writes server_args rebuilds the role it was supposed to leave.
         self.assertEqual(runtime_context.get_disagg().disaggregation_mode, "decode")
         s.init_disaggregation.assert_called_once()
+        # The pool observer and the invariant checker are frozen snapshots of the
+        # tree cache, the session controller and the role, so they are rebuilt --
+        # and only once all three are final, i.e. after init_disaggregation. A
+        # checker left on the dead tree reads a false KV leak and aborts.
+        names = [c[0] for c in s.method_calls]
+        self.assertEqual(names.count("init_pool_stats_observer"), 1)
+        self.assertEqual(names.count("init_invariant_checker"), 1)
+        self.assertGreater(
+            names.index("init_pool_stats_observer"), names.index("init_disaggregation")
+        )
+        self.assertGreater(
+            names.index("init_invariant_checker"),
+            names.index("init_pool_stats_observer"),
+        )
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
         s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
