@@ -860,7 +860,6 @@ class TestPrefixCacheRebuildOnRoleSwitch(unittest.TestCase):
                 s.token_to_kv_pool_allocator.clear.assert_called_once_with()
                 s.init_kv_cache_and_memory_pool.assert_called_once_with()
                 s.init_schedule_policy.assert_called_once_with()
-                self.assertIs(s.session_controller.tree_cache, s.tree_cache)
 
     def test_teardown_invokes_the_rebuild(self):
         s = _radix_scheduler(disable_radix_cache=False)

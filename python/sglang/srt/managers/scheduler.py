@@ -1043,6 +1043,8 @@ class Scheduler(
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
+        self.session_controller = SessionController(self.tree_cache)
+
         if (
             get_disagg().disaggregation_mode == "decode"
             and get_disagg().disaggregation_decode_enable_offload_kvcache
@@ -1105,7 +1107,6 @@ class Scheduler(
             ipc_channels=self.ipc_channels,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
-        self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
 

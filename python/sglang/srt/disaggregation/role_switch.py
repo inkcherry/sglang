@@ -17,7 +17,6 @@ import msgspec
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
 from sglang.srt.runtime_context import get_context, get_schedule
-from sglang.srt.session.session_controller import SessionController
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -367,4 +366,3 @@ def _rebuild_prefix_cache_for_role(scheduler: Scheduler) -> None:
     scheduler.token_to_kv_pool_allocator.clear()
     scheduler.init_kv_cache_and_memory_pool()
     scheduler.init_schedule_policy()
-    scheduler.session_controller = SessionController(scheduler.tree_cache)
