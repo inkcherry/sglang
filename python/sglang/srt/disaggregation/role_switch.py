@@ -213,9 +213,7 @@ def _derive_targets(
         disable_radix_cache=(
             not sa.disaggregation_decode_enable_radix_cache
             if new_role == "decode"
-            # A decode-launched instance had the operator's own flag overwritten
-            # by the decode forcing; the launch value is what it always served.
-            else scheduler._pd_role_switch_launch_disable_radix_cache
+            else scheduler._pd_role_switch_prefill_disable_radix_cache
         ),
     )
 

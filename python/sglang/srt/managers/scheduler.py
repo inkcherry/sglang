@@ -494,9 +494,9 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_kv_cache_and_memory_pool()
-        # Not captured inside the builder above: the reconcile calls it again
-        # per role and would overwrite the launch value.
-        self._pd_role_switch_launch_disable_radix_cache = (
+        # Settled outside the builder above, which the reconcile re-runs per
+        # role and would overwrite this from.
+        self._pd_role_switch_prefill_disable_radix_cache = (
             role_switch.launch_prefill_cache_class(
                 disaggregation_mode=self.server_args.disaggregation_mode,
                 disable_radix_cache=self.disable_radix_cache,

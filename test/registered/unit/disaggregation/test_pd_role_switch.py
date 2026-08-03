@@ -95,7 +95,7 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     # Launched with radix on, as a prefill instance is.
     sa.disaggregation_decode_enable_radix_cache = False
     sa.disable_radix_cache = False
-    s._pd_role_switch_launch_disable_radix_cache = False
+    s._pd_role_switch_prefill_disable_radix_cache = False
     s.chunked_prefill_size = 8192
     # The bag outlives a single test, so restate it rather than inherit it.
     runtime_context.get_context().override(
