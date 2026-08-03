@@ -76,6 +76,10 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     sa.speculative_num_draft_tokens = None
     s.max_running_requests = 128
     s._pd_role_switch_launch_cap = 128
+    # Launched with radix on, as a prefill instance is.
+    sa.disaggregation_decode_enable_radix_cache = False
+    sa.disable_radix_cache = False
+    s._pd_role_switch_launch_disable_radix_cache = False
     s.chunked_prefill_size = 8192
     # The bag outlives a single test, so restate it rather than inherit it.
     runtime_context.get_context().override(
@@ -331,6 +335,18 @@ class TestRoleConfigReconcile(unittest.TestCase):
         self.assertTrue(s._pd_role_switch_unhealthy)
         self.assertEqual(s.max_running_requests, 128)
 
+    def test_cache_class_follows_the_role_and_the_flip_back_restores_it(self):
+        """A decode server is forced to chunk cache, so the class the rebuild
+        reads must be re-derived per role: settling it once at launch leaves a
+        flipped instance serving the class it was launched with."""
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        with patch.object(moriep, "rebuild_mori_dispatch_buffers"):
+            Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="decode"))
+            self.assertTrue(s.server_args.disable_radix_cache)
+            s.disaggregation_mode = DisaggregationMode.DECODE
+            Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="prefill"))
+        self.assertFalse(s.server_args.disable_radix_cache)
+
     def test_cap_clamp_does_not_ratchet_across_flips(self):
         """The cap may only be lowered relative to the LAUNCH ceiling. Comparing
         against the live value instead makes each flip lower it again, so a
@@ -578,7 +594,7 @@ except Exception:  # pragma: no cover - environment dependent
 
 try:
     from sglang.srt.disaggregation.role_switch import (  # noqa: E402
-        _release_prefix_cache_for_role_switch,
+        _rebuild_prefix_cache_for_role,
         teardown_disaggregation,
     )
 
@@ -782,30 +798,34 @@ def _radix_scheduler(disable_radix_cache):
 
 
 @unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
-class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
-    """The flip may run with radix cache ENABLED: teardown resets the tree cache
-    + KV pools when radix is on, and is a no-op on the historical chunk-cache path."""
+class TestPrefixCacheRebuildOnRoleSwitch(unittest.TestCase):
+    """Radix vs chunk is keyed on the role, so the tree cache is rebuilt in the
+    target role's class, not reset in place -- and the prefixes that keep KV
+    slots locked are released first, which only radix holds."""
 
-    def test_noop_when_radix_disabled(self):
+    def test_only_radix_holds_prefixes_to_release(self):
         s = _radix_scheduler(disable_radix_cache=True)
-        _release_prefix_cache_for_role_switch(s)
+        _rebuild_prefix_cache_for_role(s)
         s.tree_cache.reset.assert_not_called()
-        s.token_to_kv_pool_allocator.clear.assert_not_called()
+        s.init_kv_cache_and_memory_pool.assert_called_once_with()
 
-    def test_releases_when_radix_enabled(self):
+    def test_rebuild_rebinds_the_holders_that_captured_the_tree(self):
         s = _radix_scheduler(disable_radix_cache=False)
-        _release_prefix_cache_for_role_switch(s)
+        _rebuild_prefix_cache_for_role(s)
         s.tree_cache.reset.assert_called_once_with()
         s.req_to_token_pool.clear.assert_called_once_with()
         s.token_to_kv_pool_allocator.clear.assert_called_once_with()
+        s.init_kv_cache_and_memory_pool.assert_called_once_with()
+        s.init_schedule_policy.assert_called_once_with()
+        self.assertIs(s.session_controller.tree_cache, s.tree_cache)
 
-    def test_teardown_invokes_release(self):
+    def test_teardown_invokes_the_rebuild(self):
         s = _radix_scheduler(disable_radix_cache=False)
         s.disaggregation_mode = DisaggregationMode.PREFILL
         s.disagg_prefill_bootstrap_queue = None  # no queue -> skip km.teardown()
         teardown_disaggregation(s)
         self.assertIsNone(s.disagg_metadata_buffers)
-        s.tree_cache.reset.assert_called_once_with()
+        s.init_kv_cache_and_memory_pool.assert_called_once_with()
 
 
 if __name__ == "__main__":
