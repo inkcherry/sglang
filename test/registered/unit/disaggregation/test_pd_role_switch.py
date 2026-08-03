@@ -330,8 +330,7 @@ class TestMoriA2AResize(unittest.TestCase):
         error can cross. `spec=["reconfigure"]` fails if anything else is read."""
         (old, new), _ = self._resize(512, [512])
         self.assertEqual((old, new), (4096, 512))
-        # The group must be the gloo one: mori's outcome reduction is on a CPU
-        # tensor and the default (nccl) PG raises mid-resize.
+        # Must be the gloo group: the default (nccl) PG raises mid-resize.
         self.op.reconfigure.assert_called_once_with(
             512, group=moriep._LIVE_OPS[0].group.cpu_group
         )

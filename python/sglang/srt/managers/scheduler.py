@@ -979,9 +979,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        # Ceiling the role-switch reconcile clamps every target admit cap to.
-        # Captured at launch because the reconcile writes max_running_requests,
-        # so re-reading it would let each flip ratchet the cap down further.
+        # The ceiling the role-switch reconcile clamps every target admit cap to.
         self._pd_role_switch_launch_cap = self.max_running_requests
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
