@@ -385,11 +385,8 @@ class MoriA2AGroupDead(MoriA2AResizeError):
 
 
 def _is_group_fatal(exc: BaseException) -> bool:
-    """Whether mori reports the op as unrecoverable (its `ResizeFatal`).
-
-    Read off the raised class rather than imported, so a mori build without the
-    resize outcome types still resizes instead of failing at import.
-    """
+    """mori's `ResizeFatal`, read off the raised class rather than imported so a
+    mori build without the resize outcome types still resizes."""
     return any(c.__name__ == "ResizeFatal" for c in type(exc).__mro__)
 
 
