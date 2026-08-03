@@ -417,17 +417,12 @@ def rebuild_mori_dispatch_buffers(
 ) -> Optional[Tuple[int, int]]:
     """Resize every live mori a2a dispatch buffer for `role`.
 
-    Returns the (old, new) per-rank capacity, or None if the group voted to
-    leave the buffers alone. Raises on refusal or failure; mori reduces the
-    outcome over the group, so every rank raises the same type.
+    Returns the (old, new) per-rank capacity, or None if there is no dispatcher
+    yet or the group voted to leave the buffers alone. Raises on refusal or
+    failure; mori reduces the outcome over the group, so every rank raises the
+    same type.
     """
     if not _LIVE_OPS:
-        # The op is built on the first MoE forward, so an instance flipped before
-        # serving anything has none; silence reads like a resize that happened.
-        logger.info(
-            "[pd-role-switch] a2a dispatcher not built yet; nothing to resize for %s",
-            role,
-        )
         return None
     ceiling = get_int_env_var("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096)
     agreed = _agree_capacity(target_tokens_per_rank, _LIVE_OPS[0].group)
