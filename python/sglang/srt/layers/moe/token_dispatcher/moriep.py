@@ -457,7 +457,7 @@ def rebuild_mori_dispatch_buffers(
         old,
         agreed,
         _LIVE_OPS[0].rank,
-        role[0],
+        role,
     )
     return old, agreed
 
