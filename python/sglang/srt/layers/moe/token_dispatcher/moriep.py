@@ -423,9 +423,7 @@ def rebuild_mori_dispatch_buffers(
     """
     if not _LIVE_OPS:
         # The op is built on the first MoE forward, so an instance flipped before
-        # it has served anything has no buffer to size -- it will be built at the
-        # process ceiling instead. Staying silent here reads, in the server log,
-        # exactly like a resize that happened.
+        # serving anything has none; silence reads like a resize that happened.
         logger.info(
             "[pd-role-switch] a2a dispatcher not built yet; nothing to resize for %s",
             role,
