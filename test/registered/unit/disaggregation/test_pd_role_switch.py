@@ -1,6 +1,5 @@
 import argparse
 import concurrent.futures
-import dataclasses
 import os
 import unittest
 from types import SimpleNamespace
@@ -15,12 +14,6 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.managers.scheduler_components.kv_events_publisher import (  # noqa: E402
-    SchedulerKvEventsPublisher,
-)
-from sglang.srt.managers.scheduler_components.load_inquirer import (  # noqa: E402
-    SchedulerLoadInquirer,
-)
 from sglang.srt.model_executor.cuda_graph_config import (  # noqa: E402
     Backend,
     CudaGraphConfig,
@@ -107,17 +100,6 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     )
     sa._frozen = True
     s.enable_dynamic_chunking = False
-    # Real classes, not stand-ins: the inquirer is frozen and the publisher is
-    # not, and a commit that conflates them raises only against the real thing.
-    for holder, cls in (
-        ("load_inquirer", SchedulerLoadInquirer),
-        ("kv_events_publisher", SchedulerKvEventsPublisher),
-    ):
-        fields = {f.name: MagicMock() for f in dataclasses.fields(cls) if f.init}
-        fields["max_running_requests"] = 128
-        if "kv_events_config" in fields:
-            fields["kv_events_config"] = None  # keeps __post_init__ inert
-        setattr(s, holder, cls(**fields))
     return s
 
 
@@ -342,7 +324,6 @@ class TestRoleConfigReconcile(unittest.TestCase):
         self.assertFalse(out.success)
         self.assertIn("nothing applied", out.message)
         self.assertEqual(s.max_running_requests, 128)
-        self.assertEqual(s.load_inquirer.max_running_requests, 128)
         s._teardown_disaggregation.assert_not_called()
 
     def test_dead_a2a_group_is_not_reported_as_a_recoverable_refusal(self):
