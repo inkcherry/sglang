@@ -128,8 +128,7 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
 
     view = resolved_view(server_args)
     # (present, waivable, item). Only expert parallelism over the mori a2a is
-    # waivable; the rest build per-role state a flip never rebuilds, so the knob
-    # would silently stop applying. Deriving the waiver from this same table is
+    # waivable, and only as a pair; deriving the waiver from this same table is
     # what stops a new row from being rejected but not blocking the waiver.
     checks = (
         (view.enable_dp_attention, False, "DP attention (--enable-dp-attention)"),
@@ -154,8 +153,6 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
     )
     unsupported = [item for present, _, item in checks if present]
 
-    # The gate waives expert parallelism and the mori a2a together and only
-    # together — anything else present keeps the whole configuration rejected.
     gate = server_args.enable_pd_role_switch_experimental_moe
     ep_over_mori = view.ep_size > 1 and view.moe_a2a_backend == "mori"
     others = any(present and not waivable for present, waivable, _ in checks)
