@@ -384,6 +384,15 @@ class MoriA2AGroupDead(MoriA2AResizeError):
     either. Unlike every other resize failure this is not recoverable."""
 
 
+def _is_group_fatal(exc: BaseException) -> bool:
+    """Whether mori reports the op as unrecoverable (its `ResizeFatal`).
+
+    Read off the raised class rather than imported, so a mori build without the
+    resize outcome types still resizes instead of failing at import.
+    """
+    return any(c.__name__ == "ResizeFatal" for c in type(exc).__mro__)
+
+
 def _agree_capacity(target: Optional[int], group) -> Optional[int]:
     """Reduce every rank's proposed per-rank capacity to one group verdict.
 
@@ -430,8 +439,6 @@ def rebuild_mori_dispatch_buffers(
             f"was launched with SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK={ceiling}; "
             "launch flip-capable instances at the larger of the two roles"
         )
-    from mori.ops.dispatch_combine import ResizeFatal
-
     old = _LIVE_OPS[0].capacity
     for live in _LIVE_OPS:
         try:
@@ -439,8 +446,10 @@ def rebuild_mori_dispatch_buffers(
             # and the default PG is nccl, which raises after the free, before
             # the handles refresh -- leaving the op pointing at released memory.
             live.op.reconfigure(agreed, group=live.group.cpu_group)
-        except ResizeFatal as e:
-            raise MoriA2AGroupDead(e) from e
+        except Exception as e:
+            if _is_group_fatal(e):
+                raise MoriA2AGroupDead(e) from e
+            raise
         live.capacity = agreed
     logger.info(
         "[pd-role-switch] a2a capacity %d -> %d rank=%d role=%s",
