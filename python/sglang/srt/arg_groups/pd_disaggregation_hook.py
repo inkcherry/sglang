@@ -156,16 +156,16 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
     # together — anything else present keeps the whole configuration rejected.
     gate = server_args.enable_pd_role_switch_experimental_moe
     ep_over_mori = view.ep_size > 1 and view.moe_a2a_backend == "mori"
-    if gate and ep_over_mori:
-        if not (view.enable_dp_attention or view.pp_size > 1 or view.dp_size > 1):
-            logger.warning(
-                "EXPERIMENTAL: PD role switch with expert parallelism "
-                "(--ep-size %d) over the mori MoE all-to-all. The a2a dispatch "
-                "buffer is rebuilt for the new role on every flip; that rebuild "
-                "is not yet validated for numerical correctness.",
-                view.ep_size,
-            )
-            return
+    others = view.enable_dp_attention or view.pp_size > 1 or view.dp_size > 1
+    if gate and ep_over_mori and not others:
+        logger.warning(
+            "EXPERIMENTAL: PD role switch with expert parallelism "
+            "(--ep-size %d) over the mori MoE all-to-all. The a2a dispatch "
+            "buffer is rebuilt for the new role on every flip; that rebuild "
+            "is not yet validated for numerical correctness.",
+            view.ep_size,
+        )
+        return
 
     if unsupported:
         raise ValueError(
