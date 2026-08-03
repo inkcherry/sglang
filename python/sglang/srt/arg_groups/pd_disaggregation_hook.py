@@ -144,8 +144,7 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
             (view.dp_size > 1, f"data parallelism (--dp-size {view.dp_size})"),
             (
                 offload,
-                "decode KV offload "
-                "(--disaggregation-decode-enable-offload-kvcache)",
+                "decode KV offload " "(--disaggregation-decode-enable-offload-kvcache)",
             ),
             (delayer, "the prefill delayer (--enable-prefill-delayer)"),
         )
