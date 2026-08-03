@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt import runtime_context  # noqa: E402
-from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.layers.moe.token_dispatcher import moriep  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
@@ -547,8 +546,6 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     def test_guard_runs_after_parallelism_is_resolved(self):
         """DWDP forces dp attention and dp_size long after the PD arg hook has
         run, so the guard must not live in that hook."""
-        from sglang.srt.server_args import ServerArgs
-
         order = ServerArgs.__post_init__.__code__.co_names
         self.assertGreater(
             order.index("_check_pd_role_switch_support"), order.index("_handle_dwdp")
