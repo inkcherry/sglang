@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
+import msgspec
+
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
     get_global_expert_distribution_recorder,
@@ -349,7 +351,88 @@ def init_mori_op(
 
     mori_config = mori.ops.EpDispatchCombineConfig(**common_kwargs)
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
+    _LIVE_OPS.append(
+        _LiveOp(op=mori_op, group=group, capacity=num_max_dispatch_tokens_per_rank)
+    )
     return mori_op
+
+
+class _LiveOp(msgspec.Struct):
+    op: object
+    group: object
+    # Tracked here rather than read back off the op: after a failed resize the
+    # op's buffer pointers may be freed, and reading them through pybind
+    # segfaults the rank before any error can cross.
+    capacity: int
+
+
+# `init_mori_op` is lru_cached, so ops are shared across layers: this holds one
+# entry per distinct op (1-2 in practice), not one per MoE layer.
+_LIVE_OPS: List[_LiveOp] = []
+
+
+class MoriA2AResizeError(RuntimeError):
+    """The EP group could not agree a new a2a capacity, or refused it."""
+
+
+def _agree_capacity(target: Optional[int], group) -> Optional[int]:
+    """Reduce every rank's proposed per-rank capacity to one group verdict.
+
+    A rank that cannot derive a target votes 0 and the whole group then leaves
+    the buffers alone. It must not return early: its peers would enter a
+    collective it never joins and the group hangs.
+    """
+    cpu_group = group.cpu_group
+    lo = torch.tensor([target or 0], dtype=torch.int64)
+    hi = lo.clone()
+    torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=cpu_group)
+    torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=cpu_group)
+    lo, hi = int(lo.item()), int(hi.item())
+    if lo == 0:
+        return None
+    if lo != hi:
+        raise MoriA2AResizeError(
+            f"EP ranks disagree on the a2a capacity ({lo} != {hi}); not resizing"
+        )
+    return lo
+
+
+def rebuild_mori_dispatch_buffers(
+    target_tokens_per_rank: Optional[int], role: str
+) -> Optional[Tuple[int, int]]:
+    """Resize every live mori a2a dispatch buffer for `role`.
+
+    Returns the (old, new) per-rank capacity, or None if the group voted to
+    leave the buffers alone. Raises on refusal or failure; mori reduces the
+    outcome over the group, so every rank raises the same type.
+    """
+    if not _LIVE_OPS:
+        return None
+    ceiling = get_int_env_var("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096)
+    agreed = _agree_capacity(target_tokens_per_rank, _LIVE_OPS[0].group)
+    if agreed is None:
+        logger.warning("a2a capacity not derivable on some EP rank; buffers unchanged")
+        return None
+    if agreed > ceiling:
+        # This env var is a per-process allocation ceiling, not a role's size:
+        # an instance launched below max(prefill, decode) can never flip out.
+        raise MoriA2AResizeError(
+            f"{role} needs an a2a capacity of {agreed} tokens/rank but this process "
+            f"was launched with SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK={ceiling}; "
+            "launch flip-capable instances at the larger of the two roles"
+        )
+    old = _LIVE_OPS[0].capacity
+    for live in _LIVE_OPS:
+        live.op.reconfigure(agreed)
+        live.capacity = agreed
+    logger.info(
+        "[pd-role-switch] a2a capacity %d -> %d rank=%d role=%s",
+        old,
+        agreed,
+        get_parallel().moe_ep_rank,
+        role[0],
+    )
+    return old, agreed
 
 
 class CommStreamPool:
