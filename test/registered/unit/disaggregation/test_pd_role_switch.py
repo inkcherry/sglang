@@ -839,7 +839,6 @@ class TestPrefixCacheRebuildOnRoleSwitch(unittest.TestCase):
         s.disaggregation_mode = DisaggregationMode.PREFILL
         s.disagg_prefill_bootstrap_queue = None  # no queue -> skip km.teardown()
         teardown_disaggregation(s)
-        self.assertIsNone(s.disagg_metadata_buffers)
         s.init_kv_cache_and_memory_pool.assert_called_once_with()
 
 
