@@ -84,8 +84,7 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     s.flip_calls = flip_calls = MagicMock()
     s._teardown_disaggregation = flip_calls._teardown_disaggregation
     s.init_disaggregation = flip_calls.init_disaggregation
-    s.init_pool_stats_observer = flip_calls.init_pool_stats_observer
-    s.init_invariant_checker = flip_calls.init_invariant_checker
+    s.init_kv_holder_components = flip_calls.init_kv_holder_components
     s._event_loop_should_restart = False
     s._pd_role_switch_in_progress = False
     s._pd_role_switch_unhealthy = False
@@ -192,19 +191,15 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # writes server_args rebuilds the role it was supposed to leave.
         self.assertEqual(runtime_context.get_disagg().disaggregation_mode, "decode")
         s.init_disaggregation.assert_called_once()
-        # The pool observer and the invariant checker are frozen snapshots of the
-        # tree cache, the session controller and the role, so they are rebuilt --
-        # and only once all three are final, i.e. after init_disaggregation. A
-        # checker left on the dead tree reads a false KV leak and aborts.
+        # The components that snapshot the KV pools, the prefix cache and the
+        # role are rebuilt -- and only once all three are final, i.e. after
+        # init_disaggregation. One left on the discarded tree strands a finished
+        # request's KV slots and the pool checker aborts the process.
         names = [c[0] for c in s.flip_calls.mock_calls]
-        self.assertEqual(names.count("init_pool_stats_observer"), 1)
-        self.assertEqual(names.count("init_invariant_checker"), 1)
+        self.assertEqual(names.count("init_kv_holder_components"), 1)
         self.assertGreater(
-            names.index("init_pool_stats_observer"), names.index("init_disaggregation")
-        )
-        self.assertGreater(
-            names.index("init_invariant_checker"),
-            names.index("init_pool_stats_observer"),
+            names.index("init_kv_holder_components"),
+            names.index("init_disaggregation"),
         )
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
