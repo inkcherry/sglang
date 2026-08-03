@@ -118,17 +118,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
 
 def check_pd_role_switch_support(server_args: ServerArgs) -> None:
-    """Reject a role-switch instance whose per-role buffers cannot be rebuilt.
-
-    A flip rebuilds the small role-specific disagg structures and, under the
-    experimental gate, the mori a2a dispatch buffer. Everything else (DP
-    attention, system DP, pipeline parallelism) is sized once at startup, so a
-    flip with those on would silently deadlock.
-
-    Must run at the END of the resolution pipeline: DWDP and the a2a backends
-    force dp/ep sizes late, so an early check reads a pre-resolution view and
-    admits configurations it is meant to reject.
-    """
+    """Reject a role-switch instance whose per-role buffers cannot be rebuilt."""
     if not server_args.enable_pd_role_switch:
         return
     if server_args.disaggregation_mode not in ("prefill", "decode"):

@@ -2995,9 +2995,6 @@ class ServerArgs:
         "Allow runtime prefill<->decode role switch via /pd_role_switch (PD mode).",
         NS("disagg"),
     ] = False
-    # Opt in to flipping an instance that runs expert parallelism over the mori
-    # MoE all-to-all. Only that combination is opened; every other per-role
-    # buffer (DP attention, system DP, PP) is still sized once at startup.
     enable_pd_role_switch_experimental_moe: A[
         bool,
         "EXPERIMENTAL: allow --enable-pd-role-switch with expert parallelism "
