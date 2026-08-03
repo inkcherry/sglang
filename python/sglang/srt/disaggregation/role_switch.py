@@ -192,10 +192,9 @@ def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
     """Apply the settled values. Runs only after the resize succeeded, and
     nothing here can fail, so a flip is all-or-nothing."""
     scheduler.max_running_requests = targets.max_running_requests
-    # Both components CAPTURE the cap as a field rather than reading it off the
-    # scheduler per use, so a flip has to restamp them. The inquirer is a frozen
-    # dataclass -- rebind a copy; nothing else holds a reference to it.
-    # PrefillAdder captures it too but is rebuilt per batch, so it self-updates.
+    # Both capture the cap as a field instead of reading it off the scheduler,
+    # so a flip must restamp them. The inquirer is frozen and nothing else holds
+    # a reference, so rebind a copy. PrefillAdder is rebuilt per batch already.
     scheduler.load_inquirer = dataclasses.replace(
         scheduler.load_inquirer, max_running_requests=targets.max_running_requests
     )

@@ -62,9 +62,8 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     s._pd_role_switch_launch_cap = 128
     s.chunked_prefill_size = 8192
     s.enable_dynamic_chunking = False
-    # Real classes, not stand-ins: the inquirer is a frozen dataclass and the
-    # publisher is not, and a commit that cannot tell them apart raises only
-    # against the real thing.
+    # Real classes, not stand-ins: the inquirer is frozen and the publisher is
+    # not, and a commit that conflates them raises only against the real thing.
     for holder, cls in (
         ("load_inquirer", SchedulerLoadInquirer),
         ("kv_events_publisher", SchedulerKvEventsPublisher),
