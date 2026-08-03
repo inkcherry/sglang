@@ -193,7 +193,6 @@ def _pad_to_captured_bucket(
 
 
 def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
-    """Apply the settled values; runs only after the resize succeeded."""
     scheduler.max_running_requests = targets.max_running_requests
     # Both capture the cap as a field instead of reading it off the scheduler,
     # so a flip must restamp them. The inquirer is frozen and nothing else holds
