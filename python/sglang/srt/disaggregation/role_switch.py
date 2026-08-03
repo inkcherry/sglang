@@ -16,6 +16,7 @@ import msgspec
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
+from sglang.srt.runtime_context import get_context, get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -149,7 +150,9 @@ def _derive_targets(
         recv_req.max_running_requests or scheduler._pd_role_switch_launch_cap,
         scheduler._pd_role_switch_launch_cap,
     )
-    chunk = recv_req.chunked_prefill_size or sa.chunked_prefill_size
+    # Not server_args: that stays the pristine startup record, so a second flip
+    # would re-derive the LAUNCH chunk instead of the one the first flip settled.
+    chunk = recv_req.chunked_prefill_size or get_schedule().chunked_prefill_size
     if new_role == "prefill":
         # A dynamic chunker may predict a bigger chunk; size to its ceiling.
         dispatch_tokens = (
@@ -199,7 +202,12 @@ def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
         scheduler.load_inquirer, max_running_requests=targets.max_running_requests
     )
     scheduler.kv_events_publisher.max_running_requests = targets.max_running_requests
-    scheduler.chunked_prefill_size = targets.chunked_prefill_size
+    # The config bag is the source of truth for this leaf -- the per-step chunk
+    # truncation reads it directly -- and the scheduler field is a snapshot of
+    # it, normalized the same way the scheduler normalizes it at startup.
+    chunk = targets.chunked_prefill_size
+    get_context().override("pd_role_switch.reconcile", chunked_prefill_size=chunk)
+    scheduler.chunked_prefill_size = chunk if chunk and chunk > 0 else None
     if targets.moe_max_input_tokens is None:
         os.environ.pop(_MOE_MAX_INPUT_TOKENS, None)
     else:
