@@ -52,15 +52,30 @@ def tearDownModule():
     runtime_context.reset_context()
 
 
+class _FrozenServerArgs(SimpleNamespace):
+    """Enforces the real contract: once the config is resolved server_args is
+    read-only and every write goes through override(). A permissive stand-in
+    lets a bare assignment pass here and raise on the first live flip."""
+
+    _frozen = False
+
+    def __setattr__(self, name, value):
+        if self._frozen:
+            raise AttributeError(f"server_args.{name} assigned after resolution")
+        super().__setattr__(name, value)
+
+    def override(self, source, **fields):
+        for name, value in fields.items():
+            super().__setattr__(name, value)
+
+
 def _make_scheduler(mode, *, enable=True, idle=True):
     s = Scheduler.__new__(Scheduler)
     s.disaggregation_mode = mode
-    sa = SimpleNamespace(
+    sa = _FrozenServerArgs(
         enable_pd_role_switch=enable,
         disaggregation_mode=mode.value,
     )
-    # Mirror the real ServerArgs mutation entry the flip path calls.
-    sa.override = lambda source, **fields: sa.__dict__.update(fields)
     s.server_args = sa
     s.is_fully_idle = MagicMock(return_value=idle)
     s._teardown_disaggregation = MagicMock()
@@ -85,6 +100,7 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     runtime_context.get_context().override(
         "test", chunked_prefill_size=8192, disaggregation_mode=mode.value
     )
+    sa._frozen = True
     s.enable_dynamic_chunking = False
     # Real classes, not stand-ins: the inquirer is frozen and the publisher is
     # not, and a commit that conflates them raises only against the real thing.
