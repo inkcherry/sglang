@@ -465,6 +465,18 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         ("PP", dict(pp_size=2), False, False),
         ("EP + deepep a2a", dict(ep_size=4, moe_a2a_backend="deepep"), False, False),
         (
+            "decode KV offload",
+            dict(disaggregation_decode_enable_offload_kvcache=True),
+            False,
+            False,
+        ),
+        (
+            "EP + mori a2a + prefill delayer",
+            dict(ep_size=4, moe_a2a_backend="mori", enable_prefill_delayer=True),
+            False,
+            False,
+        ),
+        (
             "DWDP",
             dict(enable_dp_attention=True, ep_size=4, dp_size=4),
             False,
@@ -488,6 +500,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             moe_a2a_backend="none",
             pp_size=1,
             dp_size=1,
+            disaggregation_decode_enable_offload_kvcache=False,
+            enable_prefill_delayer=False,
         )
         base.update(kw)
         return SimpleNamespace(**base)
