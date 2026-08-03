@@ -229,66 +229,89 @@ class TestPdRoleSwitchReqSerialization(unittest.TestCase):
 
 
 class TestPdRoleSwitchStartupValidation(unittest.TestCase):
-    """--enable-pd-role-switch only rebuilds the small role-specific disagg
-    structures on a flip; the per-role buffers of DP attention / EP / MoE
-    all-to-all / pipeline parallelism are sized at startup and not rebuilt, so
-    a flip with those on would silently deadlock. The PD arg hook must reject
-    the combination up-front instead of failing at flip time."""
+    """The startup guard admits pure TP, and -- only under the experimental
+    gate -- expert parallelism over the mori a2a. Every other per-role buffer
+    is sized once at startup, so a flip with it on would silently deadlock.
+
+    The matrix below is the acceptance oracle: each row is checked both with
+    and without the gate flag. Sizes reflect the RESOLVED view, which is why
+    the guard runs after the resolution pipeline (mori forces ep=tp, DWDP
+    forces dp attention and dp_size).
+    """
+
+    # (name, resolved-config overrides, accepted-without-gate, accepted-with-gate)
+    MATRIX = (
+        ("pure TP", {}, True, True),
+        ("EP, no a2a", dict(ep_size=4), False, False),
+        ("EP + mori a2a", dict(ep_size=4, moe_a2a_backend="mori"), False, True),
+        ("DP attention", dict(enable_dp_attention=True, dp_size=2), False, False),
+        ("system DP", dict(dp_size=2), False, False),
+        ("PP", dict(pp_size=2), False, False),
+        ("EP + deepep a2a", dict(ep_size=4, moe_a2a_backend="deepep"), False, False),
+        (
+            "DWDP",
+            dict(enable_dp_attention=True, ep_size=4, dp_size=4),
+            False,
+            False,
+        ),
+        (
+            "EP + mori a2a, no role switch",
+            dict(ep_size=4, moe_a2a_backend="mori", enable_pd_role_switch=False),
+            True,
+            True,
+        ),
+    )
 
     def _sa(self, **kw):
         base = dict(
-            disaggregation_transfer_backend="mori",
             disaggregation_mode="prefill",
             enable_pd_role_switch=True,
+            enable_pd_role_switch_experimental_moe=False,
             enable_dp_attention=False,
             ep_size=1,
             moe_a2a_backend="none",
             pp_size=1,
             dp_size=1,
-            dcp_size=1,
         )
         base.update(kw)
         return SimpleNamespace(**base)
 
     def _run(self, sa):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
-            handle_pd_disaggregation,
+            check_pd_role_switch_support,
         )
 
-        handle_pd_disaggregation(sa)
+        check_pd_role_switch_support(sa)
 
-    def test_pure_tp_role_switch_accepted(self):
-        # No raise for the validated pure-TP configuration.
-        self._run(self._sa())
+    def test_gate_matrix(self):
+        for name, cfg, ok_plain, ok_gated in self.MATRIX:
+            for gate, expected in ((False, ok_plain), (True, ok_gated)):
+                with self.subTest(row=name, gate=gate):
+                    sa = self._sa(
+                        enable_pd_role_switch_experimental_moe=gate, **cfg
+                    )
+                    if expected:
+                        self._run(sa)
+                    else:
+                        with self.assertRaises(ValueError):
+                            self._run(sa)
 
-    def test_reject_dp_attention(self):
+    def test_reject_names_every_unsupported_feature(self):
+        sa = self._sa(enable_dp_attention=True, ep_size=4, dp_size=4)
         with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(enable_dp_attention=True))
-        self.assertIn("DP attention", str(ctx.exception))
+            self._run(sa)
+        for clause in ("DP attention", "expert parallelism", "data parallelism"):
+            self.assertIn(clause, str(ctx.exception))
 
-    def test_reject_expert_parallelism(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(ep_size=8))
-        self.assertIn("expert parallelism", str(ctx.exception))
+    def test_guard_runs_after_parallelism_is_resolved(self):
+        """DWDP forces dp attention and dp_size long after the PD arg hook has
+        run, so the guard must not live in that hook."""
+        from sglang.srt.server_args import ServerArgs
 
-    def test_reject_moe_a2a(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(moe_a2a_backend="mori"))
-        self.assertIn("MoE all-to-all", str(ctx.exception))
-
-    def test_reject_pipeline_parallelism(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(pp_size=2))
-        self.assertIn("pipeline parallelism", str(ctx.exception))
-
-    def test_reject_data_parallelism(self):
-        with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(dp_size=2))
-        self.assertIn("data parallelism", str(ctx.exception))
-
-    def test_no_role_switch_is_unaffected(self):
-        # The same unsupported feature is fine when role switch is off.
-        self._run(self._sa(enable_pd_role_switch=False, moe_a2a_backend="mori"))
+        order = ServerArgs.__post_init__.__code__.co_names
+        self.assertGreater(
+            order.index("_check_pd_role_switch_support"), order.index("_handle_dwdp")
+        )
 
 
 # --- teardown: transfer-worker thread-leak fix + prefix-cache release (radix ON) ---
