@@ -14,16 +14,16 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.model_executor.cuda_graph_config import (  # noqa: E402
-    Backend,
-    CudaGraphConfig,
-    PhaseConfig,
-)
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (  # noqa: E402
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.load_inquirer import (  # noqa: E402
     SchedulerLoadInquirer,
+)
+from sglang.srt.model_executor.cuda_graph_config import (  # noqa: E402
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
 )
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci

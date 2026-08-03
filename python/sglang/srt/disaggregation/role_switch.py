@@ -64,9 +64,7 @@ def handle_pd_role_switch(
                 # Before the reconcile, not after: the a2a buffer is sized from
                 # the padded decode batch, which is only knowable once the
                 # runner has published its live captured-bucket ladder.
-                _capture_decode_cuda_graphs(
-                    scheduler, recv_req.decode_cuda_graph_bs
-                )
+                _capture_decode_cuda_graphs(scheduler, recv_req.decode_cuda_graph_bs)
             reconcile_role_config(scheduler, new_role, recv_req)
         except Exception as e:
             if scheduler._pd_role_switch_unhealthy:
