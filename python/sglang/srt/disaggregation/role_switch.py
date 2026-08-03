@@ -237,14 +237,9 @@ def _pad_to_captured_bucket(
 
 
 def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
+    # Holders that capture the cap as a field are rebuilt from this by
+    # init_kv_holder_components once the flip completes.
     scheduler.max_running_requests = targets.max_running_requests
-    # Both capture the cap as a field instead of reading it off the scheduler,
-    # so a flip must restamp them. The inquirer is frozen and nothing else holds
-    # a reference, so rebind a copy. PrefillAdder is rebuilt per batch already.
-    scheduler.load_inquirer = dataclasses.replace(
-        scheduler.load_inquirer, max_running_requests=targets.max_running_requests
-    )
-    scheduler.kv_events_publisher.max_running_requests = targets.max_running_requests
     # The scheduler field is a snapshot of the bag, normalized as it is at startup.
     chunk = targets.chunked_prefill_size
     get_context().override("pd_role_switch.reconcile", chunked_prefill_size=chunk)
