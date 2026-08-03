@@ -67,6 +67,8 @@ def handle_pd_role_switch(
                 )
             reconcile_role_config(scheduler, new_role, recv_req)
         except Exception as e:
+            if scheduler._pd_role_switch_unhealthy:
+                return _fail(f"a2a group is dead; restart required: {e}")
             return _fail(f"role config reconcile failed, nothing applied: {e}")
 
         try:
@@ -121,11 +123,18 @@ def reconcile_role_config(
     cache needs no step: its class is operator config, not role-derived.
     """
     from sglang.srt.layers.moe.token_dispatcher.moriep import (
+        MoriA2AGroupDead,
         rebuild_mori_dispatch_buffers,
     )
 
     targets = _derive_targets(scheduler, new_role, recv_req)
-    rebuild_mori_dispatch_buffers(targets.dispatch_tokens, new_role)
+    try:
+        rebuild_mori_dispatch_buffers(targets.dispatch_tokens, new_role)
+    except MoriA2AGroupDead:
+        # Not a config write, so all-or-nothing still holds: the buffers are
+        # gone group-wide and the instance cannot serve the old role either.
+        scheduler._pd_role_switch_unhealthy = True
+        raise
     _commit_targets(scheduler, targets)
 
 
