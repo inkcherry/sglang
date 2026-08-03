@@ -580,21 +580,24 @@ class Scheduler(
 
         self.init_request_receiver()
 
-        self.init_dp_attn_adapter()
-
-        self.init_pool_stats_observer()
-
-        self.init_invariant_checker()
-
-        self.init_kv_events_publisher()
-
-        self.init_load_inquirer()
-
-        self.init_output_streamer()
-
-        self.init_batch_result_processor()
+        self.init_kv_holder_components()
 
         self.is_initializing = False
+
+    def init_kv_holder_components(self) -> None:
+        """Build the components that snapshot the KV pools, the prefix cache or
+        the role. Re-runnable: a role switch rebuilds all three and calls this
+        again, so a component that captures any of them belongs here. One left
+        on the discarded objects frees a finished request's KV slots into a tree
+        nobody reads, which strands them until the pool checker aborts.
+        """
+        self.init_dp_attn_adapter()
+        self.init_pool_stats_observer()
+        self.init_invariant_checker()
+        self.init_kv_events_publisher()
+        self.init_load_inquirer()
+        self.init_output_streamer()
+        self.init_batch_result_processor()
 
     def init_zbal_on_npu(self):
         if _is_npu:
