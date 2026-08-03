@@ -150,8 +150,7 @@ def _derive_targets(
         recv_req.max_running_requests or scheduler._pd_role_switch_launch_cap,
         scheduler._pd_role_switch_launch_cap,
     )
-    # Not server_args: that stays the pristine startup record, so a second flip
-    # would re-derive the LAUNCH chunk instead of the one the first flip settled.
+    # Not server_args: it stays the pristine launch record across flips.
     chunk = recv_req.chunked_prefill_size or get_schedule().chunked_prefill_size
     if new_role == "prefill":
         # A dynamic chunker may predict a bigger chunk; size to its ceiling.
@@ -202,9 +201,8 @@ def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
         scheduler.load_inquirer, max_running_requests=targets.max_running_requests
     )
     scheduler.kv_events_publisher.max_running_requests = targets.max_running_requests
-    # The config bag is the source of truth for this leaf -- the per-step chunk
-    # truncation reads it directly -- and the scheduler field is a snapshot of
-    # it, normalized the same way the scheduler normalizes it at startup.
+    # The bag is the source of truth (the per-step chunk truncation reads it);
+    # the scheduler field is a snapshot, normalized as it is at startup.
     chunk = targets.chunked_prefill_size
     get_context().override("pd_role_switch.reconcile", chunked_prefill_size=chunk)
     scheduler.chunked_prefill_size = chunk if chunk and chunk > 0 else None

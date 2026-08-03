@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt import runtime_context  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.layers.moe.token_dispatcher import moriep  # noqa: E402
@@ -19,7 +20,6 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (  # no
 from sglang.srt.managers.scheduler_components.load_inquirer import (  # noqa: E402
     SchedulerLoadInquirer,
 )
-from sglang.srt import runtime_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -39,8 +39,7 @@ class TestPdRoleSwitchServerArg(unittest.TestCase):
 
 
 def setUpModule():
-    # The flip writes resolved config onto the namespace bags, which only exist
-    # once a context is published.
+    # The flip writes resolved config onto the bags, which need a published context.
     runtime_context.get_context().set_server_args(ServerArgs(model_path="dummy"))
 
 
@@ -262,8 +261,7 @@ class TestRoleConfigReconcile(unittest.TestCase):
         self.assertTrue(out.success)
         resize.assert_called_once_with(2048, "prefill")
         self.assertEqual(s.chunked_prefill_size, 2048)
-        # The scheduler field is only a snapshot; the per-step chunk truncation
-        # reads the bag, so a settled chunk that lands in one is a desync.
+        # The per-step chunk truncation reads the bag, not the scheduler field.
         self.assertEqual(runtime_context.get_schedule().chunked_prefill_size, 2048)
         # And it stays settled: a flip that does not restate the chunk must not
         # resurrect the launch value off the pristine server_args.
