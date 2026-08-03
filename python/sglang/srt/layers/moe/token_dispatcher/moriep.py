@@ -422,6 +422,14 @@ def rebuild_mori_dispatch_buffers(
     outcome over the group, so every rank raises the same type.
     """
     if not _LIVE_OPS:
+        # The op is built on the first MoE forward, so an instance flipped before
+        # it has served anything has no buffer to size -- it will be built at the
+        # process ceiling instead. Staying silent here reads, in the server log,
+        # exactly like a resize that happened.
+        logger.info(
+            "[pd-role-switch] a2a dispatcher not built yet; nothing to resize for %s",
+            role,
+        )
         return None
     ceiling = get_int_env_var("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096)
     agreed = _agree_capacity(target_tokens_per_rank, _LIVE_OPS[0].group)
