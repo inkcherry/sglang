@@ -8,7 +8,10 @@ Kept out of scheduler.py to avoid growing it further.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+import os
+from typing import TYPE_CHECKING, Optional, Sequence
+
+import msgspec
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
@@ -55,6 +58,18 @@ def handle_pd_role_switch(
         # new role not up) and isn't safe to serve, so mark it unhealthy. There
         # is no in-place rollback.
         try:
+            if new_role == "decode":
+                # Before the reconcile, not after: the a2a buffer is sized from
+                # the padded decode batch, which is only knowable once the
+                # runner has published its live captured-bucket ladder.
+                scheduler.tp_worker.ensure_decode_cuda_graphs(
+                    recv_req.decode_cuda_graph_bs
+                )
+            reconcile_role_config(scheduler, new_role, recv_req)
+        except Exception as e:
+            return _fail(f"role config reconcile failed, nothing applied: {e}")
+
+        try:
             scheduler._teardown_disaggregation()
             scheduler.server_args.override(
                 "role_switch.flip", disaggregation_mode=new_role
@@ -73,15 +88,6 @@ def handle_pd_role_switch(
                 f"role switch failed; instance unhealthy, restart required: {e}"
             )
 
-        if new_role == "decode":
-            # Best-effort deferred capture; a failure only degrades to eager.
-            try:
-                scheduler.tp_worker.ensure_decode_cuda_graphs(
-                    recv_req.decode_cuda_graph_bs
-                )
-            except Exception:
-                logger.exception("Decode CUDA graph capture on role switch failed")
-
         # Break out of the old-role event loop so the supervisor re-dispatches.
         scheduler._event_loop_should_restart = True
         logger.info("PD role switch succeeded: %s -> %s", old_role, new_role)
@@ -93,6 +99,114 @@ def handle_pd_role_switch(
         return _fail(f"role switch raised: {e}")
     finally:
         scheduler._pd_role_switch_in_progress = False
+
+
+class RoleTargets(msgspec.Struct, frozen=True):
+    """Everything the target role needs, derived before anything is written."""
+
+    max_running_requests: int
+    chunked_prefill_size: Optional[int]
+    # Per-rank a2a dispatch capacity; None means this rank could not derive one.
+    dispatch_tokens: Optional[int]
+    moe_max_input_tokens: Optional[str]
+
+
+def reconcile_role_config(
+    scheduler: Scheduler, new_role: str, recv_req: PdRoleSwitchReqInput
+) -> None:
+    """Re-derive the role-dependent runtime config and rebuild the a2a buffers.
+
+    Split into a pure derive, then the one fallible step, then infallible
+    writes. The a2a buffer must be sized from the SETTLED cap and chunk size,
+    or it gets sized for the role being left; putting every write after the
+    resize is what makes a failed flip leave nothing half-applied.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.moriep import (
+        rebuild_mori_dispatch_buffers,
+    )
+
+    targets = _derive_targets(scheduler, new_role, recv_req)
+    rebuild_mori_dispatch_buffers(targets.dispatch_tokens, new_role)
+    _commit_targets(scheduler, targets)
+
+
+def _derive_targets(
+    scheduler: Scheduler, new_role: str, recv_req: PdRoleSwitchReqInput
+) -> RoleTargets:
+    sa = scheduler.server_args
+    # Against the LAUNCH ceiling, not the current value: re-reading a cap the
+    # previous flip already lowered turns the clamp into a one-way ratchet.
+    cap = min(
+        recv_req.max_running_requests or scheduler._pd_role_switch_launch_cap,
+        scheduler._pd_role_switch_launch_cap,
+    )
+    chunk = recv_req.chunked_prefill_size or sa.chunked_prefill_size
+    if new_role == "prefill":
+        # A dynamic chunker may predict a larger chunk than today's, so size to
+        # its ceiling instead.
+        dispatch_tokens = (
+            chunk
+            if chunk and chunk > 0 and not scheduler.enable_dynamic_chunking
+            else sa.max_prefill_tokens
+        )
+    else:
+        padded = _pad_to_captured_bucket(
+            cap, scheduler.tp_worker.get_decode_cuda_graph_bs()
+        )
+        dispatch_tokens = (
+            None if padded is None else padded * (sa.speculative_num_draft_tokens or 1)
+        )
+    return RoleTargets(
+        max_running_requests=cap,
+        chunked_prefill_size=chunk,
+        dispatch_tokens=dispatch_tokens,
+        moe_max_input_tokens=os.environ.get(_MOE_MAX_INPUT_TOKENS_BY_ROLE[new_role]),
+    )
+
+
+def _pad_to_captured_bucket(
+    batch_size: int, capture_bs: Sequence[int]
+) -> Optional[int]:
+    """The batch the a2a actually sees: a CUDA-graph replay pads up to the
+    smallest captured bucket first. Must come from the runner's LIVE list --
+    the declared ladder is filtered for alignment, and removing a bucket
+    promotes the pad to the next one UP, so guessing under-sizes the buffer.
+    mori has no runtime bounds check, so an under-size is silent out-of-bounds.
+    """
+    buckets = [b for b in capture_bs if b >= batch_size]
+    if not buckets:
+        # No graphs captured (genuinely eager) or the cap exceeds every bucket.
+        return batch_size if not capture_bs else None
+    return min(buckets)
+
+
+def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
+    """Apply the settled values. Runs only after the resize succeeded, and
+    nothing here can fail, so a flip is all-or-nothing."""
+    scheduler.max_running_requests = targets.max_running_requests
+    for holder, attr in _MAX_RUNNING_REQUESTS_HOLDERS:
+        setattr(getattr(scheduler, holder), attr, targets.max_running_requests)
+    scheduler.chunked_prefill_size = targets.chunked_prefill_size
+    if targets.moe_max_input_tokens is None:
+        os.environ.pop(_MOE_MAX_INPUT_TOKENS, None)
+    else:
+        os.environ[_MOE_MAX_INPUT_TOKENS] = targets.moe_max_input_tokens
+
+
+# Components that CAPTURE max_running_requests as a field instead of reading it
+# off the scheduler per use, so a flip has to restamp them by name.
+_MAX_RUNNING_REQUESTS_HOLDERS = (
+    ("load_inquirer", "max_running_requests"),
+    ("kv_events_publisher", "max_running_requests"),
+    ("policy", "max_running_requests"),
+)
+
+_MOE_MAX_INPUT_TOKENS = "SGLANG_MORI_MOE_MAX_INPUT_TOKENS"
+# The launcher exports one per role; the reconcile picks the target role's.
+_MOE_MAX_INPUT_TOKENS_BY_ROLE = {
+    "prefill": "MORI_MOE_MAX_INPUT_TOKENS_PREFILL",
+    "decode": "MORI_MOE_MAX_INPUT_TOKENS_DECODE",
+}
 
 
 def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[str]:

@@ -1897,6 +1897,10 @@ class PdRoleSwitchReqInput(BaseReq, kw_only=True):
     # Optional decode bs to capture on a flip to decode (capture-to-fit);
     # None uses the server's configured decode bs list.
     decode_cuda_graph_bs: Optional[List[int]] = None
+    # Target-role admit cap and chunk size; None keeps the launch value. The cap
+    # may only be lowered, never raised above what the KV pool was sized for.
+    max_running_requests: Optional[int] = None
+    chunked_prefill_size: Optional[int] = None
 
 
 class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
