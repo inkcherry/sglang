@@ -437,14 +437,16 @@ def rebuild_mori_dispatch_buffers(
             "launch flip-capable instances at the larger of the two roles"
         )
     old = _LIVE_OPS[0].capacity
-    for live in _LIVE_OPS:
+    for i, live in enumerate(_LIVE_OPS):
         try:
             # Must be the shmem group: mori reduces the outcome on a CPU tensor
             # and the default PG is nccl, which raises after the free, before
             # the handles refresh -- leaving the op pointing at released memory.
             live.op.reconfigure(agreed, group=live.group.cpu_group)
         except Exception as e:
-            if _is_group_fatal(e):
+            # Past the first op even a clean refusal is unrecoverable: the ops
+            # already resized cannot serve the old role's token count.
+            if i or _is_group_fatal(e):
                 raise MoriA2AGroupDead(e) from e
             raise
         live.capacity = agreed
