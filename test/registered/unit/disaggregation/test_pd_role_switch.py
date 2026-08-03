@@ -79,8 +79,13 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     )
     s.server_args = sa
     s.is_fully_idle = MagicMock(return_value=idle)
-    s._teardown_disaggregation = MagicMock()
-    s.init_disaggregation = MagicMock()
+    # Share one parent so a test can assert the ORDER of the flip's rebuild
+    # steps, not merely that each ran.
+    s.flip_calls = flip_calls = MagicMock()
+    s._teardown_disaggregation = flip_calls._teardown_disaggregation
+    s.init_disaggregation = flip_calls.init_disaggregation
+    s.init_pool_stats_observer = flip_calls.init_pool_stats_observer
+    s.init_invariant_checker = flip_calls.init_invariant_checker
     s._event_loop_should_restart = False
     s._pd_role_switch_in_progress = False
     s._pd_role_switch_unhealthy = False
@@ -191,7 +196,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # tree cache, the session controller and the role, so they are rebuilt --
         # and only once all three are final, i.e. after init_disaggregation. A
         # checker left on the dead tree reads a false KV leak and aborts.
-        names = [c[0] for c in s.method_calls]
+        names = [c[0] for c in s.flip_calls.mock_calls]
         self.assertEqual(names.count("init_pool_stats_observer"), 1)
         self.assertEqual(names.count("init_invariant_checker"), 1)
         self.assertGreater(
