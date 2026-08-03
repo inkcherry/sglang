@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (  # no
 from sglang.srt.managers.scheduler_components.load_inquirer import (  # noqa: E402
     SchedulerLoadInquirer,
 )
+from sglang.srt import runtime_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -35,6 +36,16 @@ class TestPdRoleSwitchServerArg(unittest.TestCase):
 
         on = parser.parse_args(["--model-path", "dummy", "--enable-pd-role-switch"])
         self.assertTrue(on.enable_pd_role_switch)
+
+
+def setUpModule():
+    # The flip writes resolved config onto the namespace bags, which only exist
+    # once a context is published.
+    runtime_context.get_context().set_server_args(ServerArgs(model_path="dummy"))
+
+
+def tearDownModule():
+    runtime_context.reset_context()
 
 
 def _make_scheduler(mode, *, enable=True, idle=True):
@@ -55,12 +66,13 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     s._pd_role_switch_unhealthy = False
     s.tp_worker = MagicMock()
     s.tp_worker.get_decode_cuda_graph_bs.return_value = [64, 128, 256]
-    sa.chunked_prefill_size = 8192
     sa.max_prefill_tokens = 16384
     sa.speculative_num_draft_tokens = None
     s.max_running_requests = 128
     s._pd_role_switch_launch_cap = 128
     s.chunked_prefill_size = 8192
+    # The bag outlives a single test, so restate it rather than inherit it.
+    runtime_context.get_context().override("test", chunked_prefill_size=8192)
     s.enable_dynamic_chunking = False
     # Real classes, not stand-ins: the inquirer is frozen and the publisher is
     # not, and a commit that conflates them raises only against the real thing.
@@ -250,6 +262,9 @@ class TestRoleConfigReconcile(unittest.TestCase):
         self.assertTrue(out.success)
         resize.assert_called_once_with(2048, "prefill")
         self.assertEqual(s.chunked_prefill_size, 2048)
+        # The scheduler field is only a snapshot; the per-step chunk truncation
+        # reads the bag, so a settled chunk that lands in one is a desync.
+        self.assertEqual(runtime_context.get_schedule().chunked_prefill_size, 2048)
 
     def test_decode_sizes_for_the_padded_batch_from_the_live_runner(self):
         """Constraint 4: a CUDA-graph replay pads the batch up to the smallest
