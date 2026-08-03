@@ -287,7 +287,7 @@ class TestMoriA2AResize(unittest.TestCase):
     def setUp(self):
         self.op = MagicMock(spec=["reconfigure"])
         moriep._LIVE_OPS[:] = [
-            moriep._LiveOp(op=self.op, group=MagicMock(), capacity=4096)
+            moriep._LiveOp(op=self.op, group=MagicMock(), rank=0, capacity=4096)
         ]
         self.addCleanup(moriep._LIVE_OPS.clear)
 

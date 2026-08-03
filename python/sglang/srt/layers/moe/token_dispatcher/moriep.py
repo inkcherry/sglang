@@ -352,7 +352,12 @@ def init_mori_op(
     mori_config = mori.ops.EpDispatchCombineConfig(**common_kwargs)
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
     _LIVE_OPS.append(
-        _LiveOp(op=mori_op, group=group, capacity=num_max_dispatch_tokens_per_rank)
+        _LiveOp(
+            op=mori_op,
+            group=group,
+            rank=rank,
+            capacity=num_max_dispatch_tokens_per_rank,
+        )
     )
     return mori_op
 
@@ -360,6 +365,7 @@ def init_mori_op(
 class _LiveOp(msgspec.Struct):
     op: object
     group: object
+    rank: int
     # Tracked here rather than read back off the op: after a failed resize the
     # op's buffer pointers may be freed, and reading them through pybind
     # segfaults the rank before any error can cross.
@@ -429,7 +435,7 @@ def rebuild_mori_dispatch_buffers(
         "[pd-role-switch] a2a capacity %d -> %d rank=%d role=%s",
         old,
         agreed,
-        get_parallel().moe_ep_rank,
+        _LIVE_OPS[0].rank,
         role[0],
     )
     return old, agreed
