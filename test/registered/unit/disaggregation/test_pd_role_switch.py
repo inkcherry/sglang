@@ -834,21 +834,17 @@ class TestPrefixCacheRebuildOnRoleSwitch(unittest.TestCase):
     target role's class, not reset in place -- and the prefixes that keep KV
     slots locked are released first, which only radix holds."""
 
-    def test_only_radix_holds_prefixes_to_release(self):
-        s = _radix_scheduler(disable_radix_cache=True)
-        _rebuild_prefix_cache_for_role(s)
-        s.tree_cache.reset.assert_not_called()
-        s.init_kv_cache_and_memory_pool.assert_called_once_with()
-
-    def test_rebuild_rebinds_the_holders_that_captured_the_tree(self):
-        s = _radix_scheduler(disable_radix_cache=False)
-        _rebuild_prefix_cache_for_role(s)
-        s.tree_cache.reset.assert_called_once_with()
-        s.req_to_token_pool.clear.assert_called_once_with()
-        s.token_to_kv_pool_allocator.clear.assert_called_once_with()
-        s.init_kv_cache_and_memory_pool.assert_called_once_with()
-        s.init_schedule_policy.assert_called_once_with()
-        self.assertIs(s.session_controller.tree_cache, s.tree_cache)
+    def test_rebuild_rebinds_the_holders_and_releases_radix_prefixes_only(self):
+        for disable_radix_cache, resets in ((True, 0), (False, 1)):
+            with self.subTest(disable_radix_cache=disable_radix_cache):
+                s = _radix_scheduler(disable_radix_cache)
+                _rebuild_prefix_cache_for_role(s)
+                self.assertEqual(s.tree_cache.reset.call_count, resets)
+                s.req_to_token_pool.clear.assert_called_once_with()
+                s.token_to_kv_pool_allocator.clear.assert_called_once_with()
+                s.init_kv_cache_and_memory_pool.assert_called_once_with()
+                s.init_schedule_policy.assert_called_once_with()
+                self.assertIs(s.session_controller.tree_cache, s.tree_cache)
 
     def test_teardown_invokes_the_rebuild(self):
         s = _radix_scheduler(disable_radix_cache=False)
