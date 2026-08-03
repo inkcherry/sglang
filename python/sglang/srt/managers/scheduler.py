@@ -588,8 +588,8 @@ class Scheduler(
         """Build the components that snapshot the KV pools, the prefix cache or
         the role. Re-runnable: a role switch rebuilds all three and calls this
         again, so a component that captures any of them belongs here. One left
-        on the discarded objects frees a finished request's KV slots into a tree
-        nobody reads, which strands them until the pool checker aborts.
+        on the discarded objects counts an empty cache against a live pool, so a
+        healthy instance reads as leaking and the idle memory check aborts it.
         """
         self.init_dp_attn_adapter()
         self.init_pool_stats_observer()
