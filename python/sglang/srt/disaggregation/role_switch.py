@@ -78,9 +78,8 @@ def handle_pd_role_switch(
             scheduler.server_args.override(
                 "role_switch.flip", disaggregation_mode=new_role
             )
-            # Both stores are read: server_args above by the compile/readback
-            # paths, the bag here by init_disaggregation and the scheduling
-            # policy. Without this the rebuild reads the LAUNCH role back.
+            # Two stores, both read: init_disaggregation and the scheduling
+            # policy read the bag, so without this the rebuild sees the old role.
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
         except Exception as e:
@@ -195,8 +194,7 @@ def _pad_to_captured_bucket(
 
 
 def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
-    """Apply the settled values. Runs only after the resize succeeded, and
-    nothing here can fail, so a flip is all-or-nothing."""
+    """Apply the settled values; runs only after the resize succeeded."""
     scheduler.max_running_requests = targets.max_running_requests
     # Both capture the cap as a field instead of reading it off the scheduler,
     # so a flip must restamp them. The inquirer is frozen and nothing else holds
