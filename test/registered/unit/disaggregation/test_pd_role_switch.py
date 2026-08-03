@@ -404,9 +404,8 @@ class TestMoriA2AResize(unittest.TestCase):
     def test_refusal_after_an_earlier_op_resized_is_group_dead(self):
         """A clean refusal is only recoverable while nothing has been applied.
         `init_mori_op` is cached per config, so a process can hold more than one
-        op, and once an earlier one is resized no single token count serves
-        both — reported as an ordinary refusal, the caller resumes the old role
-        over a buffer that is already the new size."""
+        op; reported as an ordinary refusal, the caller would resume the old
+        role over the op that did resize."""
         second = MagicMock(spec=["reconfigure"])
         second.reconfigure.side_effect = ValueError("rejected")
         moriep._LIVE_OPS.append(
