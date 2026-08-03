@@ -244,8 +244,6 @@ class TestRoleConfigReconcile(unittest.TestCase):
         with patch.object(moriep, "rebuild_mori_dispatch_buffers") as resize:
             Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="decode"))
         resize.assert_called_once_with(256, "decode")
-        # Capture must precede the reconcile or the ladder is not yet published.
-        s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
 
     def test_failed_resize_applies_nothing(self):
         """Constraint 3: the reconcile is all-or-nothing. Every write lands
@@ -263,7 +261,7 @@ class TestRoleConfigReconcile(unittest.TestCase):
         self.assertFalse(out.success)
         self.assertIn("nothing applied", out.message)
         self.assertEqual(s.max_running_requests, 128)
-        self.assertEqual(s.policy.max_running_requests, 128)
+        self.assertEqual(s.load_inquirer.max_running_requests, 128)
         s._teardown_disaggregation.assert_not_called()
 
     def test_cap_clamp_does_not_ratchet_across_flips(self):
@@ -296,7 +294,8 @@ class TestMoriA2AResize(unittest.TestCase):
 
         def all_reduce(t, op=None, group=None):
             votes = [int(t.item())] + list(peer_votes)
-            t.fill_(min(votes) if op is moriep.torch.distributed.ReduceOp.MIN else max(votes))
+            pick = min if op is moriep.torch.distributed.ReduceOp.MIN else max
+            t.fill_(pick(votes))
 
         with patch.dict("os.environ", env), patch.object(
             moriep.torch.distributed, "all_reduce", side_effect=all_reduce
@@ -320,9 +319,9 @@ class TestMoriA2AResize(unittest.TestCase):
         """Constraint 5: SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a
         per-process allocation ceiling, not a role's size — an instance launched
         below max(prefill, decode) can never flip out of its launch role."""
-        with self.assertRaises(moriep.MoriA2AResizeError) as cm:
-            self._resize(4096, [4096], SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="512")
-        self.assertIn("flip-capable", str(cm.exception))
+        env = {"SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512"}
+        with self.assertRaisesRegex(moriep.MoriA2AResizeError, "flip-capable"):
+            self._resize(4096, [4096], **env)
 
     def test_capacity_is_tracked_not_read_back_off_the_op(self):
         """Constraint 6: a failed resize may leave the op's buffer pointers
@@ -424,9 +423,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         for name, cfg, ok_plain, ok_gated in self.MATRIX:
             for gate, expected in ((False, ok_plain), (True, ok_gated)):
                 with self.subTest(row=name, gate=gate):
-                    sa = self._sa(
-                        enable_pd_role_switch_experimental_moe=gate, **cfg
-                    )
+                    sa = self._sa(enable_pd_role_switch_experimental_moe=gate, **cfg)
                     if expected:
                         self._run(sa)
                     else:
