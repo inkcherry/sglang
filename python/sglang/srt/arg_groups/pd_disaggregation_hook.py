@@ -132,7 +132,15 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
     # what stops a new row from being rejected but not blocking the waiver.
     checks = (
         (view.enable_dp_attention, False, "DP attention (--enable-dp-attention)"),
-        (view.ep_size > 1, True, f"expert parallelism (--ep-size {view.ep_size})"),
+        # Past 8 ranks the a2a runs the inter-node kernel, whose variant is
+        # picked from the launch capacity. The rebuild resizes the buffers but
+        # does not reselect the kernel, so a flip would keep the one chosen for
+        # the role being left.
+        (
+            view.ep_size > 1,
+            view.ep_size <= 8,
+            f"expert parallelism (--ep-size {view.ep_size})",
+        ),
         (
             view.moe_a2a_backend != "none",
             view.moe_a2a_backend == "mori",
