@@ -1,6 +1,7 @@
 import argparse
 import concurrent.futures
 import dataclasses
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -293,9 +294,13 @@ class TestRoleConfigReconcile(unittest.TestCase):
     def test_failed_resize_applies_nothing(self):
         """Constraint 3: the reconcile is all-or-nothing. Every write lands
         after the only fallible step, so a refused resize leaves a prefill
-        instance carrying prefill's cap and chunk size."""
+        instance carrying prefill's cap, chunk size and MOE_MAX_INPUT_TOKENS."""
         s = self._scheduler(DisaggregationMode.PREFILL)
-        with patch.object(
+        env = {
+            "MORI_MOE_MAX_INPUT_TOKENS_DECODE": "2703",
+            "SGLANG_MORI_MOE_MAX_INPUT_TOKENS": "32768",
+        }
+        with patch.dict("os.environ", env), patch.object(
             moriep,
             "rebuild_mori_dispatch_buffers",
             side_effect=moriep.MoriA2AResizeError("nope"),
@@ -303,6 +308,7 @@ class TestRoleConfigReconcile(unittest.TestCase):
             out = Scheduler.handle_pd_role_switch(
                 s, PdRoleSwitchReqInput(new_role="decode", max_running_requests=64)
             )
+            self.assertEqual(os.environ["SGLANG_MORI_MOE_MAX_INPUT_TOKENS"], "32768")
         self.assertFalse(out.success)
         self.assertIn("nothing applied", out.message)
         self.assertEqual(s.max_running_requests, 128)
