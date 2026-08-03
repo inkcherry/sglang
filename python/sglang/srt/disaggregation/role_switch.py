@@ -55,10 +55,6 @@ def handle_pd_role_switch(
 
     scheduler._pd_role_switch_in_progress = True
     try:
-        # Teardown + role flip + rebuild are one logical atomic step. If any of
-        # them raises, the instance is left half-torn-down (old role released,
-        # new role not up) and isn't safe to serve, so mark it unhealthy. There
-        # is no in-place rollback.
         try:
             if new_role == "decode":
                 # Before the reconcile, not after: the a2a buffer is sized from
@@ -71,6 +67,10 @@ def handle_pd_role_switch(
                 return _fail(f"a2a group is dead; restart required: {e}")
             return _fail(f"role config reconcile failed, nothing applied: {e}")
 
+        # Teardown + role flip + rebuild are one logical atomic step. If any of
+        # them raises, the instance is left half-torn-down (old role released,
+        # new role not up) and isn't safe to serve, so mark it unhealthy. There
+        # is no in-place rollback.
         try:
             scheduler._teardown_disaggregation()
             scheduler.server_args.override(
