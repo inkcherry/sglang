@@ -200,9 +200,8 @@ def _derive_targets(
         disable_radix_cache=(
             not sa.disaggregation_decode_enable_radix_cache
             if new_role == "decode"
-            # An instance launched as decode has had the operator's own flag
-            # overwritten by the decode forcing, so this restores chunk cache
-            # for it -- the launch class, which is what it has always served.
+            # A decode-launched instance had the operator's own flag overwritten
+            # by the decode forcing; the launch value is what it always served.
             else scheduler._pd_role_switch_launch_disable_radix_cache
         ),
     )
@@ -331,20 +330,12 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
 def _rebuild_prefix_cache_for_role(scheduler: Scheduler) -> None:
     """Release the prefix cache and rebuild it in the new role's class.
 
-    Releasing is not optional with radix (or hicache) on: finished prefixes stay
-    in the tree and keep their KV-pool slots *locked* even while idle, so a
-    carried-over tree both matches the new role against stale prefixes whose KV
-    no longer means what it did and leaks those slots on every flip. Release
-    mirrors ``Scheduler.flush_cache``'s cache-release block (the instance is
-    already fully idle, checked before teardown) and, for hicache, best-effort
-    clears the storage backend so it is released completely.
-
-    Rebuilding rather than resetting is what makes the class role-correct:
-    radix vs chunk is decided per role, so a reset-in-place leaves a flipped
-    instance serving the class it launched with. The two holders that captured
-    the tree as a field are restamped here; the rest are rebound by the build.
-    A longest-prefix policy is not valid against a chunk cache, so the schedule
-    policy is re-derived rather than kept.
+    Release is not optional with radix (or hicache) on: finished prefixes keep
+    their KV-pool slots *locked* even while idle, so a carried-over tree both
+    matches the new role against stale prefixes and leaks those slots on every
+    flip. Rebuilding rather than resetting is what makes the class role-correct
+    -- radix vs chunk is decided per role. A longest-prefix policy is not valid
+    against a chunk cache, so the schedule policy is re-derived too.
     """
     tree_cache = scheduler.tree_cache
     if tree_cache is not None and not scheduler.disable_radix_cache:
