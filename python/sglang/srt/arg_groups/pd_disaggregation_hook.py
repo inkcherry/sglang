@@ -116,36 +116,78 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
 
-        # Runtime role switch only rebuilds the small role-specific disagg
-        # structures on a flip; the per-role buffers of DP attention / expert
-        # parallelism / MoE all-to-all / pipeline parallelism are sized at
-        # startup and not rebuilt, so a flip with those on would silently
-        # deadlock. Reject up-front instead.
-        if server_args.enable_pd_role_switch:
-            from sglang.srt.arg_groups.overrides import resolved_view
 
-            view = resolved_view(server_args)
-            unsupported = []
-            if view.enable_dp_attention:
-                unsupported.append("DP attention (--enable-dp-attention)")
-            if view.ep_size > 1:
-                unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
-            if view.moe_a2a_backend != "none":
-                unsupported.append(
-                    f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})"
-                )
-            if view.pp_size > 1:
-                unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
-            if view.dp_size > 1:
-                unsupported.append(f"data parallelism (--dp-size {view.dp_size})")
-            if unsupported:
-                raise ValueError(
-                    "--enable-pd-role-switch is only supported with pure tensor "
-                    "parallelism; per-role buffers for the following are not "
-                    "rebuilt on a flip and would deadlock at switch time: "
-                    + ", ".join(unsupported)
-                    + ". Remove these options or drop --enable-pd-role-switch."
-                )
+def check_pd_role_switch_support(server_args: ServerArgs) -> None:
+    """Reject a role-switch instance whose per-role buffers cannot be rebuilt.
+
+    A flip rebuilds the small role-specific disagg structures and, under the
+    experimental gate, the mori a2a dispatch buffer. Everything else (DP
+    attention, system DP, pipeline parallelism) is sized once at startup, so a
+    flip with those on would silently deadlock.
+
+    Must run at the END of the resolution pipeline: DWDP and the a2a backends
+    force dp/ep sizes late, so an early check reads a pre-resolution view and
+    admits configurations it is meant to reject.
+    """
+    if not server_args.enable_pd_role_switch:
+        return
+    if server_args.disaggregation_mode not in ("prefill", "decode"):
+        return
+
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    view = resolved_view(server_args)
+    unsupported = [
+        item
+        for present, item in (
+            (view.enable_dp_attention, "DP attention (--enable-dp-attention)"),
+            (view.ep_size > 1, f"expert parallelism (--ep-size {view.ep_size})"),
+            (
+                view.moe_a2a_backend != "none",
+                f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})",
+            ),
+            (view.pp_size > 1, f"pipeline parallelism (--pp-size {view.pp_size})"),
+            (view.dp_size > 1, f"data parallelism (--dp-size {view.dp_size})"),
+        )
+        if present
+    ]
+
+    # The gate waives expert parallelism and the mori a2a together and only
+    # together — anything else present keeps the whole configuration rejected.
+    gate = server_args.enable_pd_role_switch_experimental_moe
+    ep_over_mori = view.ep_size > 1 and view.moe_a2a_backend == "mori"
+    if gate and ep_over_mori:
+        if not (view.enable_dp_attention or view.pp_size > 1 or view.dp_size > 1):
+            logger.warning(
+                "EXPERIMENTAL: PD role switch with expert parallelism "
+                "(--ep-size %d) over the mori MoE all-to-all. The a2a dispatch "
+                "buffer is rebuilt for the new role on every flip; that rebuild "
+                "is not yet validated for numerical correctness.",
+                view.ep_size,
+            )
+            return
+
+    if unsupported:
+        raise ValueError(
+            "--enable-pd-role-switch is only supported with pure tensor "
+            "parallelism; per-role buffers for the following are not rebuilt "
+            "on a flip and would deadlock at switch time: "
+            + ", ".join(unsupported)
+            + ". Remove these options or drop --enable-pd-role-switch."
+            + (
+                " EP with --moe-a2a-backend mori can be opted into with "
+                "--enable-pd-role-switch-experimental-moe, but only on its own "
+                "(no DP attention, system DP, or pipeline parallelism)."
+                if gate
+                else ""
+            )
+        )
+
+    if gate:
+        logger.warning(
+            "--enable-pd-role-switch-experimental-moe has no effect without "
+            "expert parallelism (--ep-size > 1) and --moe-a2a-backend mori."
+        )
 
 
 def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:

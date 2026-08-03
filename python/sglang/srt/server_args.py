@@ -2995,6 +2995,15 @@ class ServerArgs:
         "Allow runtime prefill<->decode role switch via /pd_role_switch (PD mode).",
         NS("disagg"),
     ] = False
+    # Opt in to flipping an instance that runs expert parallelism over the mori
+    # MoE all-to-all. Only that combination is opened; every other per-role
+    # buffer (DP attention, system DP, PP) is still sized once at startup.
+    enable_pd_role_switch_experimental_moe: A[
+        bool,
+        "EXPERIMENTAL: allow --enable-pd-role-switch with expert parallelism "
+        "and --moe-a2a-backend mori.",
+        NS("disagg"),
+    ] = False
     optimistic_prefill_attempts: A[
         int,
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
@@ -3598,6 +3607,11 @@ class ServerArgs:
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
 
+        # Last validation of the resolution: the role-switch guard must see the
+        # settled parallelism (DWDP, the a2a backends and DP attention all force
+        # dp/ep sizes above).
+        self._check_pd_role_switch_support()
+
         # End of resolution: apply the accumulated declarations onto the
         # fields once (gate order). From here on server_args carries the
         # resolved configuration — post-init readers, in any process, read
@@ -3778,6 +3792,13 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _check_pd_role_switch_support(self):
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            check_pd_role_switch_support,
+        )
+
+        check_pd_role_switch_support(self)
 
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated
