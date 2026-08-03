@@ -80,12 +80,9 @@ def handle_pd_role_switch(
             # The rebuild and the scheduling policy read the bag, not server_args.
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
-            # Both are frozen snapshots taken at launch of the tree cache and
-            # the session controller, which the flip replaced. A checker left
-            # on the dead tree reads its own zero evictable/protected sizes as
-            # a KV-pool leak and kills the process on the first served request.
-            scheduler.init_pool_stats_observer()
-            scheduler.init_invariant_checker()
+            # Last, because these snapshot the KV pools, the prefix cache and
+            # the role, and only here are all three final.
+            scheduler.init_kv_holder_components()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
             logger.critical(
