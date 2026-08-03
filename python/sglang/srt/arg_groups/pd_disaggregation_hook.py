@@ -185,7 +185,7 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
                 " EP with --moe-a2a-backend mori can be opted into with "
                 "--enable-pd-role-switch-experimental-moe, but only on its own "
                 "(no DP attention, system DP, or pipeline parallelism)."
-                if gate
+                if gate or ep_over_mori
                 else ""
             )
         )
