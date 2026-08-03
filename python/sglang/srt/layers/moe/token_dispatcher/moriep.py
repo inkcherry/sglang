@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
+import msgspec
+
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
     get_global_expert_distribution_recorder,
@@ -360,8 +362,7 @@ def init_mori_op(
     return mori_op
 
 
-@dataclass
-class _LiveOp:
+class _LiveOp(msgspec.Struct):
     op: object
     group: object
     rank: int
