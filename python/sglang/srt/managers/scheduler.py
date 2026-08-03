@@ -921,8 +921,7 @@ class Scheduler(
         ) = self.tp_worker.get_worker_info()
         # The ceiling the role-switch reconcile clamps every target admit cap to.
         self._pd_role_switch_launch_cap = self.max_running_requests
-        # A flip into decode overwrites the cache class; flipping back restores
-        # this, which is the operator's own flag on a prefill-launched instance.
+        # A flip into decode overwrites the cache class; flipping back restores this.
         self._pd_role_switch_launch_disable_radix_cache = self.disable_radix_cache
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
@@ -997,12 +996,9 @@ class Scheduler(
             )
 
     def init_kv_cache_and_memory_pool(self) -> None:
-        """Build the prefix cache and bind the holders of it.
-
-        Re-runnable: a PD role switch calls this again to rebuild the tree cache
-        into the new role's class, so a new holder belongs here and not at the
-        call site. The pools are owned by the worker and returned, not
-        reallocated.
+        """Build the prefix cache and bind its holders. Re-runnable: a role
+        switch calls it again to rebuild the tree into the new role's class, so
+        a new holder belongs here and not at the call site.
         """
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
