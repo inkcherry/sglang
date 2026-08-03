@@ -17,6 +17,7 @@ import msgspec
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
 from sglang.srt.runtime_context import get_context, get_schedule
+from sglang.srt.session.session_controller import SessionController
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -137,6 +138,7 @@ class RoleTargets(msgspec.Struct, frozen=True):
     # Per-rank a2a dispatch capacity; None means this rank could not derive one.
     dispatch_tokens: Optional[int]
     moe_max_input_tokens: Optional[str]
+    disable_radix_cache: bool
 
 
 def reconcile_role_config(
@@ -146,8 +148,8 @@ def reconcile_role_config(
 
     The a2a buffer must be sized from the SETTLED cap and chunk size, or it
     gets sized for the role being left; putting every write after the resize
-    is what makes a failed flip leave nothing half-applied. The prefix cache
-    needs no step: its class is operator config, not role-derived.
+    is what makes a failed flip leave nothing half-applied. The prefix cache is
+    rebuilt later, in teardown, from the class this settles here.
     """
     from sglang.srt.layers.moe.token_dispatcher.moriep import (
         MoriA2AGroupDead,
@@ -195,6 +197,14 @@ def _derive_targets(
         chunked_prefill_size=chunk,
         dispatch_tokens=dispatch_tokens,
         moe_max_input_tokens=os.environ.get(_MOE_MAX_INPUT_TOKENS_BY_ROLE[new_role]),
+        disable_radix_cache=(
+            not sa.disaggregation_decode_enable_radix_cache
+            if new_role == "decode"
+            # An instance launched as decode has had the operator's own flag
+            # overwritten by the decode forcing, so this restores chunk cache
+            # for it -- the launch class, which is what it has always served.
+            else scheduler._pd_role_switch_launch_disable_radix_cache
+        ),
     )
 
 
@@ -231,6 +241,8 @@ def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
         os.environ.pop(_MOE_MAX_INPUT_TOKENS, None)
     else:
         os.environ[_MOE_MAX_INPUT_TOKENS] = targets.moe_max_input_tokens
+    # Read back by the cache rebuild in teardown, which runs after this.
+    scheduler.server_args.disable_radix_cache = targets.disable_radix_cache
 
 
 _MOE_MAX_INPUT_TOKENS = "SGLANG_MORI_MOE_MAX_INPUT_TOKENS"
@@ -313,29 +325,29 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
         scheduler.disagg_decode_transfer_queue = None
     scheduler.disagg_metadata_buffers = None
     scheduler.req_to_metadata_buffer_idx_allocator = None
-    _release_prefix_cache_for_role_switch(scheduler)
+    _rebuild_prefix_cache_for_role(scheduler)
 
 
-def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
-    """Release the prefix (radix/hicache) cache so a flip works with radix ON.
+def _rebuild_prefix_cache_for_role(scheduler: Scheduler) -> None:
+    """Release the prefix cache and rebuild it in the new role's class.
 
-    With radix disabled (ChunkCache) the flip needs nothing here: ChunkCache
-    keeps no persistent prefixes and, since the instance is idle before the
-    switch, the allocator is already empty. This is the historical
-    ``--disable-radix-cache`` path, left untouched by the guard below.
+    Releasing is not optional with radix (or hicache) on: finished prefixes stay
+    in the tree and keep their KV-pool slots *locked* even while idle, so a
+    carried-over tree both matches the new role against stale prefixes whose KV
+    no longer means what it did and leaks those slots on every flip. Release
+    mirrors ``Scheduler.flush_cache``'s cache-release block (the instance is
+    already fully idle, checked before teardown) and, for hicache, best-effort
+    clears the storage backend so it is released completely.
 
-    With radix (or hicache) enabled, finished prefixes stay in the tree and keep
-    their KV-pool slots *locked* even while idle. Carried across a role switch
-    that means (a) the new role would match against stale prefixes whose KV no
-    longer means what it did (corruption) and (b) those locked slots would leak
-    on every flip. Reset mirrors ``Scheduler.flush_cache``'s cache-release block
-    (the instance is already fully idle, checked before teardown) and, for
-    hicache, best-effort clears the storage backend so it is released completely.
+    Rebuilding rather than resetting is what makes the class role-correct:
+    radix vs chunk is decided per role, so a reset-in-place leaves a flipped
+    instance serving the class it launched with. The build rebinds every holder
+    of the tree; the schedule policy is re-derived because a longest-prefix
+    policy is not valid against a chunk cache, and the session controller
+    captured the tree as a field.
     """
-    if scheduler.disable_radix_cache:
-        return
     tree_cache = scheduler.tree_cache
-    if tree_cache is not None:
+    if tree_cache is not None and not scheduler.disable_radix_cache:
         clear_storage = getattr(tree_cache, "clear_storage_backend", None)
         if callable(clear_storage):
             try:
@@ -345,3 +357,6 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
         tree_cache.reset()
     scheduler.req_to_token_pool.clear()
     scheduler.token_to_kv_pool_allocator.clear()
+    scheduler.init_kv_cache_and_memory_pool()
+    scheduler.init_schedule_policy()
+    scheduler.session_controller = SessionController(scheduler.tree_cache)

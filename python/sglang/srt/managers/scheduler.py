@@ -921,6 +921,9 @@ class Scheduler(
         ) = self.tp_worker.get_worker_info()
         # The ceiling the role-switch reconcile clamps every target admit cap to.
         self._pd_role_switch_launch_cap = self.max_running_requests
+        # A flip into decode overwrites the cache class; flipping back restores
+        # this, which is the operator's own flag on a prefill-launched instance.
+        self._pd_role_switch_launch_disable_radix_cache = self.disable_radix_cache
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
