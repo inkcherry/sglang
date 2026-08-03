@@ -493,36 +493,7 @@ class Scheduler(
             time.sleep(t)
 
         # Init cache and memory pool
-        result = kv_cache_builder.build_kv_cache(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            tp_worker=self.tp_worker,
-            page_size=self.page_size,
-            spec_algorithm=self.spec_algorithm,
-            attn_tp_cpu_group=self.attn_tp_cpu_group,
-            tp_cpu_group=self.tp_cpu_group,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
-            enable_metrics=get_observability().enable_metrics,
-            enable_kv_cache_events=bool(
-                get_observability().kv_events_config
-                and self.ps.pp_rank == 0
-                and self.ps.attn_tp_rank == 0
-                and self.ps.attn_cp_rank == 0
-            ),
-            ps=self.ps,
-            tp_group=self.tp_group,
-            pp_group=self.pp_group,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-        )
-        self.is_hybrid_swa = result.is_hybrid_swa
-        self.is_hybrid_ssm = result.is_hybrid_ssm
-        self.sliding_window_size = result.sliding_window_size
-        self.full_tokens_per_layer = result.full_tokens_per_layer
-        self.swa_tokens_per_layer = result.swa_tokens_per_layer
-        self.req_to_token_pool = result.req_to_token_pool
-        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
-        self.disable_radix_cache = result.disable_radix_cache
-        self.tree_cache = result.tree_cache
+        self.init_kv_cache_and_memory_pool()
 
         if _is_npu and is_deepseek_v4(
             self.tp_worker.model_runner.model_config.hf_config
@@ -540,38 +511,7 @@ class Scheduler(
             )
             logger.info("HCCL DP prewarm done: rank=%s", rank)
 
-        if (c := self.tp_worker.model_runner.canary_manager) is not None:
-            c.attach_radix_cache(self.tree_cache)
-
         self.init_hisparse_coordinator()
-
-        if (
-            get_disagg().disaggregation_mode == "decode"
-            and get_disagg().disaggregation_decode_enable_offload_kvcache
-        ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=(
-                    self.attn_tp_cpu_group
-                    if self.enable_dp_attention
-                    else self.tp_cpu_group
-                ),
-                tree_cache=self.tree_cache,
-                server_args=self.server_args,
-            )
-        else:
-            self.decode_offload_manager = None
-
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        kv_cache_builder.maybe_register_hicache_draft(
-            tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-            page_size=self.page_size,
-        )
 
         # Init running status
         self.init_running_status()
@@ -1052,6 +992,76 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
+
+    def init_kv_cache_and_memory_pool(self) -> None:
+        """Build the prefix cache and bind every holder of it.
+
+        Re-runnable: a PD role switch calls this to rebuild the tree cache into
+        the new role's class, so every holder must be (re)bound here and nowhere
+        else. The memory pools themselves are owned by the worker and are
+        returned, not reallocated.
+        """
+        result = kv_cache_builder.build_kv_cache(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            tp_worker=self.tp_worker,
+            page_size=self.page_size,
+            spec_algorithm=self.spec_algorithm,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            tp_cpu_group=self.tp_cpu_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            enable_metrics=get_observability().enable_metrics,
+            enable_kv_cache_events=bool(
+                get_observability().kv_events_config
+                and self.ps.pp_rank == 0
+                and self.ps.attn_tp_rank == 0
+                and self.ps.attn_cp_rank == 0
+            ),
+            ps=self.ps,
+            tp_group=self.tp_group,
+            pp_group=self.pp_group,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+        )
+        self.is_hybrid_swa = result.is_hybrid_swa
+        self.is_hybrid_ssm = result.is_hybrid_ssm
+        self.sliding_window_size = result.sliding_window_size
+        self.full_tokens_per_layer = result.full_tokens_per_layer
+        self.swa_tokens_per_layer = result.swa_tokens_per_layer
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.disable_radix_cache = result.disable_radix_cache
+        self.tree_cache = result.tree_cache
+
+        if (c := self.tp_worker.model_runner.canary_manager) is not None:
+            c.attach_radix_cache(self.tree_cache)
+
+        if (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_offload_kvcache
+        ):
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+        else:
+            self.decode_offload_manager = None
+
+        # Register draft KV pool (when spec + HiCache co-enabled).
+        kv_cache_builder.maybe_register_hicache_draft(
+            tree_cache=self.tree_cache,
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            page_size=self.page_size,
+        )
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
