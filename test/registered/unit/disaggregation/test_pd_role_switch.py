@@ -71,7 +71,9 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     s._pd_role_switch_launch_cap = 128
     s.chunked_prefill_size = 8192
     # The bag outlives a single test, so restate it rather than inherit it.
-    runtime_context.get_context().override("test", chunked_prefill_size=8192)
+    runtime_context.get_context().override(
+        "test", chunked_prefill_size=8192, disaggregation_mode=mode.value
+    )
     s.enable_dynamic_chunking = False
     # Real classes, not stand-ins: the inquirer is frozen and the publisher is
     # not, and a commit that conflates them raises only against the real thing.
@@ -155,6 +157,9 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # Orchestration: drain -> teardown -> flip server arg -> rebuild -> signal.
         s._teardown_disaggregation.assert_called_once()
         self.assertEqual(s.server_args.disaggregation_mode, "decode")
+        # init_disaggregation re-reads the role off the bag, so a flip that only
+        # writes server_args rebuilds the role it was supposed to leave.
+        self.assertEqual(runtime_context.get_disagg().disaggregation_mode, "decode")
         s.init_disaggregation.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
