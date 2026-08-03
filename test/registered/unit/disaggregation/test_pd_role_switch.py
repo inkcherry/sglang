@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt import runtime_context  # noqa: E402
+from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.layers.moe.token_dispatcher import moriep  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
@@ -362,6 +363,21 @@ class TestRoleConfigReconcile(unittest.TestCase):
             s.disaggregation_mode = DisaggregationMode.DECODE
             Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="prefill"))
         self.assertFalse(s.server_args.disable_radix_cache)
+
+    def test_a_decode_launch_does_not_carry_its_forcing_into_prefill(self):
+        """The launch capture is what a flip to prefill restores. A decode
+        launch has had the flag overwritten by the chunk-cache forcing, so
+        replaying it would serve prefill with no prefix reuse at all."""
+        self.assertFalse(
+            role_switch.launch_prefill_cache_class(
+                disaggregation_mode="decode", disable_radix_cache=True
+            )
+        )
+        self.assertTrue(
+            role_switch.launch_prefill_cache_class(
+                disaggregation_mode="prefill", disable_radix_cache=True
+            )
+        )
 
     def test_cap_clamp_does_not_ratchet_across_flips(self):
         """The cap may only be lowered relative to the LAUNCH ceiling. Comparing
