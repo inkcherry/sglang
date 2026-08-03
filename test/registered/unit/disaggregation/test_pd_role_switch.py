@@ -568,7 +568,6 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         )
 
 
-# --- teardown: transfer-worker thread-leak fix + prefix-cache release (radix ON) ---
 import threading  # noqa: E402
 import time  # noqa: E402
 
