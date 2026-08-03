@@ -587,6 +587,14 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             self._run(sa)
         for clause in ("DP attention", "expert parallelism", "data parallelism"):
             self.assertIn(clause, str(ctx.exception))
+        # Nothing here is waivable, so the opt-in must not be offered as a fix.
+        self.assertNotIn("experimental-moe", str(ctx.exception))
+
+        # EP over mori is what the opt-in waives, and a launch that never passed
+        # it is the only one that still needs to be told it exists.
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._sa(ep_size=4, moe_a2a_backend="mori"))
+        self.assertIn("experimental-moe", str(ctx.exception))
 
     def test_guard_runs_after_parallelism_is_resolved(self):
         """DWDP forces dp attention and dp_size long after the PD arg hook has
