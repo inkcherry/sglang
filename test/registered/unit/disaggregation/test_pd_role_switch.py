@@ -125,10 +125,8 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     orchestration order without standing up a model.
     """
 
-    _scheduler = staticmethod(_make_scheduler)
-
     def test_rejected_when_flag_disabled(self):
-        s = self._scheduler(DisaggregationMode.PREFILL, enable=False)
+        s = _make_scheduler(DisaggregationMode.PREFILL, enable=False)
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
         )
@@ -138,14 +136,14 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s._teardown_disaggregation.assert_not_called()
 
     def test_rejected_on_invalid_role(self):
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         out = Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="both"))
         self.assertFalse(out.success)
         self.assertIn("invalid new_role", out.message)
         s._teardown_disaggregation.assert_not_called()
 
     def test_rejected_when_not_in_pd_mode(self):
-        s = self._scheduler(DisaggregationMode.NULL)
+        s = _make_scheduler(DisaggregationMode.NULL)
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
         )
@@ -154,7 +152,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s._teardown_disaggregation.assert_not_called()
 
     def test_same_role_is_noop(self):
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="prefill")
         )
@@ -165,7 +163,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertFalse(s._event_loop_should_restart)
 
     def test_rejected_when_not_idle(self):
-        s = self._scheduler(DisaggregationMode.PREFILL, idle=False)
+        s = _make_scheduler(DisaggregationMode.PREFILL, idle=False)
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
         )
@@ -174,7 +172,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s._teardown_disaggregation.assert_not_called()
 
     def test_successful_flip_orchestration(self):
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
         )
@@ -196,7 +194,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertFalse(s._pd_role_switch_in_progress)
 
     def test_flip_to_prefill_skips_decode_graph_capture(self):
-        s = self._scheduler(DisaggregationMode.DECODE)
+        s = _make_scheduler(DisaggregationMode.DECODE)
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="prefill")
         )
@@ -208,7 +206,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertTrue(s._event_loop_should_restart)
 
     def test_rejected_when_switch_in_progress(self):
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         s._pd_role_switch_in_progress = True
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
@@ -218,7 +216,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s._teardown_disaggregation.assert_not_called()
 
     def test_rejected_when_unhealthy(self):
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         s._pd_role_switch_unhealthy = True
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
@@ -228,7 +226,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s._teardown_disaggregation.assert_not_called()
 
     def test_rebuild_failure_marks_unhealthy_and_notifies(self):
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         # Rebuild of the new role fails after the old role was torn down.
         s.init_disaggregation = MagicMock(side_effect=RuntimeError("boom"))
 
@@ -257,7 +255,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         """Teardown, the role flip and rebuild are one atomic step: a failure
         during teardown (not only rebuild) must also mark the instance unhealthy
         and must not proceed to rebuild."""
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         s._teardown_disaggregation = MagicMock(side_effect=RuntimeError("boom"))
 
         out = Scheduler.handle_pd_role_switch(
@@ -279,13 +277,11 @@ class TestRoleConfigReconcile(unittest.TestCase):
     """The reconcile that re-derives the role-dependent config and resizes the
     mori a2a buffer, driven through the real handler."""
 
-    _scheduler = staticmethod(_make_scheduler)
-
     def test_a2a_sized_from_settled_chunk_not_the_current_one(self):
         """Constraint 2: settle the cap and chunk size first, then size the a2a
         buffer from the settled values. Sizing from the live scheduler fields
         builds the buffer for the role being LEFT."""
-        s = self._scheduler(DisaggregationMode.DECODE)
+        s = _make_scheduler(DisaggregationMode.DECODE)
         with patch.object(moriep, "rebuild_mori_dispatch_buffers") as resize:
             out = Scheduler.handle_pd_role_switch(
                 s,
@@ -305,7 +301,7 @@ class TestRoleConfigReconcile(unittest.TestCase):
         """Constraint 4: a CUDA-graph replay pads the batch up to the smallest
         captured bucket before the a2a sees it, and the bucket ladder must come
         from the live runner (the declared one is filtered, which pads UP)."""
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         s._pd_role_switch_launch_cap = 129
         with patch.object(moriep, "rebuild_mori_dispatch_buffers") as resize:
             Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="decode"))
@@ -315,7 +311,7 @@ class TestRoleConfigReconcile(unittest.TestCase):
         """Constraint 3: the reconcile is all-or-nothing. Every write lands
         after the only fallible step, so a refused resize leaves a prefill
         instance carrying prefill's cap, chunk size and MOE_MAX_INPUT_TOKENS."""
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         env = {
             "MORI_MOE_MAX_INPUT_TOKENS_DECODE": "2703",
             "SGLANG_MORI_MOE_MAX_INPUT_TOKENS": "32768",
@@ -338,7 +334,7 @@ class TestRoleConfigReconcile(unittest.TestCase):
     def test_dead_a2a_group_is_not_reported_as_a_recoverable_refusal(self):
         """A dead group is the one resize failure the old role cannot survive:
         the instance must go unhealthy rather than resume serving."""
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         with patch.object(
             moriep,
             "rebuild_mori_dispatch_buffers",
@@ -356,7 +352,7 @@ class TestRoleConfigReconcile(unittest.TestCase):
         """A decode server is forced to chunk cache, so the class the rebuild
         reads must be re-derived per role: settling it once at launch leaves a
         flipped instance serving the class it was launched with."""
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         with patch.object(moriep, "rebuild_mori_dispatch_buffers"):
             Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="decode"))
             self.assertTrue(s.server_args.disable_radix_cache)
@@ -383,7 +379,7 @@ class TestRoleConfigReconcile(unittest.TestCase):
         """The cap may only be lowered relative to the LAUNCH ceiling. Comparing
         against the live value instead makes each flip lower it again, so a
         flip-back refuses the pool size it was actually launched with."""
-        s = self._scheduler(DisaggregationMode.PREFILL)
+        s = _make_scheduler(DisaggregationMode.PREFILL)
         with patch.object(moriep, "rebuild_mori_dispatch_buffers"):
             Scheduler.handle_pd_role_switch(
                 s, PdRoleSwitchReqInput(new_role="decode", max_running_requests=32)
