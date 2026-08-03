@@ -2,9 +2,11 @@ import argparse
 import concurrent.futures
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.layers.moe.token_dispatcher import moriep  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
@@ -53,6 +55,16 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s._pd_role_switch_in_progress = False
         s._pd_role_switch_unhealthy = False
         s.tp_worker = MagicMock()
+        s.tp_worker.get_decode_cuda_graph_bs.return_value = [64, 128, 256]
+        sa.chunked_prefill_size = 8192
+        sa.max_prefill_tokens = 16384
+        sa.speculative_num_draft_tokens = None
+        s.max_running_requests = 128
+        s._pd_role_switch_launch_cap = 128
+        s.chunked_prefill_size = 8192
+        s.enable_dynamic_chunking = False
+        for holder, _ in role_switch._MAX_RUNNING_REQUESTS_HOLDERS:
+            setattr(s, holder, SimpleNamespace(max_running_requests=128))
         return s
 
     def test_rejected_when_flag_disabled(self):
@@ -198,6 +210,128 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         # Teardown raised, so rebuild is never attempted.
         self.assertEqual(s._teardown_disaggregation.call_count, 1)
         s.init_disaggregation.assert_not_called()
+
+
+class TestRoleConfigReconcile(TestHandlePdRoleSwitch):
+    """The reconcile that re-derives the role-dependent config and resizes the
+    mori a2a buffer. Inherits the scheduler fixture from the handler tests."""
+
+    def _flip(self, mode, new_role, **req):
+        s = self._scheduler(mode)
+        with patch.object(moriep, "rebuild_mori_dispatch_buffers") as resize:
+            out = Scheduler.handle_pd_role_switch(
+                s, PdRoleSwitchReqInput(new_role=new_role, **req)
+            )
+        return s, out, resize
+
+    def test_a2a_sized_from_settled_chunk_not_the_current_one(self):
+        """Constraint 2: settle the cap and chunk size first, then size the a2a
+        buffer from the settled values. Sizing from the live scheduler fields
+        builds the buffer for the role being LEFT."""
+        s, out, resize = self._flip(
+            DisaggregationMode.DECODE, "prefill", chunked_prefill_size=2048
+        )
+        self.assertTrue(out.success)
+        resize.assert_called_once_with(2048, "prefill")
+        self.assertEqual(s.chunked_prefill_size, 2048)
+
+    def test_decode_sizes_for_the_padded_batch_from_the_live_runner(self):
+        """Constraint 4: a CUDA-graph replay pads the batch up to the smallest
+        captured bucket before the a2a sees it, and the bucket ladder must come
+        from the live runner (the declared one is filtered, which pads UP)."""
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        s._pd_role_switch_launch_cap = 129
+        with patch.object(moriep, "rebuild_mori_dispatch_buffers") as resize:
+            Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="decode"))
+        resize.assert_called_once_with(256, "decode")
+        # Capture must precede the reconcile or the ladder is not yet published.
+        s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
+
+    def test_failed_resize_applies_nothing(self):
+        """Constraint 3: the reconcile is all-or-nothing. Every write lands
+        after the only fallible step, so a refused resize leaves a prefill
+        instance carrying prefill's cap and chunk size."""
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        with patch.object(
+            moriep,
+            "rebuild_mori_dispatch_buffers",
+            side_effect=moriep.MoriA2AResizeError("nope"),
+        ):
+            out = Scheduler.handle_pd_role_switch(
+                s, PdRoleSwitchReqInput(new_role="decode", max_running_requests=64)
+            )
+        self.assertFalse(out.success)
+        self.assertIn("nothing applied", out.message)
+        self.assertEqual(s.max_running_requests, 128)
+        self.assertEqual(s.policy.max_running_requests, 128)
+        s._teardown_disaggregation.assert_not_called()
+
+    def test_cap_clamp_does_not_ratchet_across_flips(self):
+        """The cap may only be lowered relative to the LAUNCH ceiling. Comparing
+        against the live value instead makes each flip lower it again, so a
+        flip-back refuses the pool size it was actually launched with."""
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        with patch.object(moriep, "rebuild_mori_dispatch_buffers"):
+            Scheduler.handle_pd_role_switch(
+                s, PdRoleSwitchReqInput(new_role="decode", max_running_requests=32)
+            )
+            self.assertEqual(s.max_running_requests, 32)
+            s.disaggregation_mode = DisaggregationMode.DECODE
+            Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="prefill"))
+        self.assertEqual(s.max_running_requests, 128)
+
+
+class TestMoriA2AResize(unittest.TestCase):
+    """The EP-group side of the a2a rebuild."""
+
+    def setUp(self):
+        self.op = MagicMock(spec=["reconfigure"])
+        moriep._LIVE_OPS[:] = [
+            moriep._LiveOp(op=self.op, group=MagicMock(), capacity=4096)
+        ]
+        self.addCleanup(moriep._LIVE_OPS.clear)
+
+    def _resize(self, target, peer_votes, **env):
+        """Run a rebuild with the peers' votes folded into the reduction."""
+
+        def all_reduce(t, op=None, group=None):
+            votes = [int(t.item())] + list(peer_votes)
+            t.fill_(min(votes) if op is moriep.torch.distributed.ReduceOp.MIN else max(votes))
+
+        with patch.dict("os.environ", env), patch.object(
+            moriep.torch.distributed, "all_reduce", side_effect=all_reduce
+        ) as reduce:
+            return moriep.rebuild_mori_dispatch_buffers(target, "decode"), reduce
+
+    def test_underivable_target_is_a_vote_not_an_early_return(self):
+        """Constraint 1: a rank that derives no target must still enter the
+        collective. Returning early leaves its peers in a reduction nobody
+        joins, which hangs the group."""
+        result, reduce = self._resize(None, [512])
+        self.assertIsNone(result)
+        self.assertTrue(reduce.called)
+        self.op.reconfigure.assert_not_called()
+
+    def test_disagreeing_ranks_are_refused_not_resized(self):
+        with self.assertRaises(moriep.MoriA2AResizeError):
+            self._resize(256, [512])
+
+    def test_target_above_the_process_ceiling_is_refused(self):
+        """Constraint 5: SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a
+        per-process allocation ceiling, not a role's size — an instance launched
+        below max(prefill, decode) can never flip out of its launch role."""
+        with self.assertRaises(moriep.MoriA2AResizeError) as cm:
+            self._resize(4096, [4096], SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="512")
+        self.assertIn("flip-capable", str(cm.exception))
+
+    def test_capacity_is_tracked_not_read_back_off_the_op(self):
+        """Constraint 6: a failed resize may leave the op's buffer pointers
+        freed, and reading them back through pybind kills the rank before the
+        error can cross. `spec=["reconfigure"]` fails if anything else is read."""
+        (old, new), _ = self._resize(512, [512])
+        self.assertEqual((old, new), (4096, 512))
+        self.op.reconfigure.assert_called_once_with(512)
+        self.assertEqual(moriep._LIVE_OPS[0].capacity, 512)
 
 
 class TestPdRoleSwitchReqSerialization(unittest.TestCase):
