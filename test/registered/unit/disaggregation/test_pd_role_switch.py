@@ -520,6 +520,12 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         ("pure TP", {}, True, True),
         ("EP, no a2a", dict(ep_size=4), False, False),
         ("EP + mori a2a", dict(ep_size=4, moe_a2a_backend="mori"), False, True),
+        (
+            "inter-node EP + mori a2a",
+            dict(ep_size=16, moe_a2a_backend="mori"),
+            False,
+            False,
+        ),
         ("DP attention", dict(enable_dp_attention=True, dp_size=2), False, False),
         ("system DP", dict(dp_size=2), False, False),
         ("PP", dict(pp_size=2), False, False),
