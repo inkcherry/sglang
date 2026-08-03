@@ -265,6 +265,12 @@ class TestRoleConfigReconcile(unittest.TestCase):
         # The scheduler field is only a snapshot; the per-step chunk truncation
         # reads the bag, so a settled chunk that lands in one is a desync.
         self.assertEqual(runtime_context.get_schedule().chunked_prefill_size, 2048)
+        # And it stays settled: a flip that does not restate the chunk must not
+        # resurrect the launch value off the pristine server_args.
+        s.disaggregation_mode = DisaggregationMode.PREFILL
+        with patch.object(moriep, "rebuild_mori_dispatch_buffers"):
+            Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="decode"))
+        self.assertEqual(runtime_context.get_schedule().chunked_prefill_size, 2048)
 
     def test_decode_sizes_for_the_padded_batch_from_the_live_runner(self):
         """Constraint 4: a CUDA-graph replay pads the batch up to the smallest
