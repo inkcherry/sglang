@@ -264,6 +264,23 @@ class TestRoleConfigReconcile(unittest.TestCase):
         self.assertEqual(s.load_inquirer.max_running_requests, 128)
         s._teardown_disaggregation.assert_not_called()
 
+    def test_dead_a2a_group_is_not_reported_as_a_recoverable_refusal(self):
+        """A dead group is the one resize failure the old role cannot survive:
+        the instance must go unhealthy rather than resume serving."""
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        with patch.object(
+            moriep,
+            "rebuild_mori_dispatch_buffers",
+            side_effect=moriep.MoriA2AGroupDead("gone"),
+        ):
+            out = Scheduler.handle_pd_role_switch(
+                s, PdRoleSwitchReqInput(new_role="decode")
+            )
+        self.assertFalse(out.success)
+        self.assertIn("restart required", out.message)
+        self.assertTrue(s._pd_role_switch_unhealthy)
+        self.assertEqual(s.max_running_requests, 128)
+
     def test_cap_clamp_does_not_ratchet_across_flips(self):
         """The cap may only be lowered relative to the LAUNCH ceiling. Comparing
         against the live value instead makes each flip lower it again, so a
@@ -334,6 +351,17 @@ class TestMoriA2AResize(unittest.TestCase):
             512, group=moriep._LIVE_OPS[0].group.cpu_group
         )
         self.assertEqual(moriep._LIVE_OPS[0].capacity, 512)
+
+    def test_fatal_resize_is_distinguished_from_a_clean_refusal(self):
+        """mori's ResizeFatal means at least one rank holds no buffers, so the
+        OLD role cannot dispatch either. Reported as an ordinary refusal, the
+        instance would keep serving into a dead op."""
+        self.op.reconfigure.side_effect = type("ResizeFatal", (RuntimeError,), {})()
+        with self.assertRaises(moriep.MoriA2AGroupDead):
+            self._resize(512, [512])
+        self.op.reconfigure.side_effect = ValueError("rejected")
+        with self.assertRaises(ValueError):
+            self._resize(512, [512])
 
 
 class TestPdRoleSwitchReqSerialization(unittest.TestCase):
