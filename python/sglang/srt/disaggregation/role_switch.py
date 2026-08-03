@@ -64,8 +64,8 @@ def handle_pd_role_switch(
                 # Before the reconcile, not after: the a2a buffer is sized from
                 # the padded decode batch, which is only knowable once the
                 # runner has published its live captured-bucket ladder.
-                scheduler.tp_worker.ensure_decode_cuda_graphs(
-                    recv_req.decode_cuda_graph_bs
+                _capture_decode_cuda_graphs(
+                    scheduler, recv_req.decode_cuda_graph_bs
                 )
             reconcile_role_config(scheduler, new_role, recv_req)
         except Exception as e:
@@ -106,6 +106,31 @@ def handle_pd_role_switch(
         return _fail(f"role switch raised: {e}")
     finally:
         scheduler._pd_role_switch_in_progress = False
+
+
+def _capture_decode_cuda_graphs(
+    scheduler: Scheduler, capture_bs: Optional[Sequence[int]]
+) -> None:
+    """Capture the decode graphs for the target role, or decode eagerly.
+
+    A prefill instance launched with the decode graph disabled is the normal PD
+    launch, and its bucket ladder can filter down to empty -- which the capture
+    treats as fatal. Refusing the flip there makes the feature unusable, so fall
+    back to eager. The runner turns the graph on before it can fail, so undo
+    that; its server_args stamp needs no undo, no live reader consults it.
+    """
+    cfg = scheduler.server_args.cuda_graph_config
+    decode_backend = None if cfg is None else cfg.decode.backend
+    try:
+        scheduler.tp_worker.ensure_decode_cuda_graphs(capture_bs)
+    except Exception as e:
+        if cfg is not None:
+            cfg.decode.backend = decode_backend
+        logger.warning(
+            "PD role switch: decode CUDA graph capture failed (%s); "
+            "the flipped instance will decode eagerly",
+            e,
+        )
 
 
 class RoleTargets(msgspec.Struct, frozen=True):
