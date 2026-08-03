@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -12,6 +13,12 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.kv_events_publisher import (  # noqa: E402
+    SchedulerKvEventsPublisher,
+)
+from sglang.srt.managers.scheduler_components.load_inquirer import (  # noqa: E402
+    SchedulerLoadInquirer,
+)
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -55,8 +62,18 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     s._pd_role_switch_launch_cap = 128
     s.chunked_prefill_size = 8192
     s.enable_dynamic_chunking = False
-    for holder, _ in role_switch._MAX_RUNNING_REQUESTS_HOLDERS:
-        setattr(s, holder, SimpleNamespace(max_running_requests=128))
+    # Real classes, not stand-ins: the inquirer is a frozen dataclass and the
+    # publisher is not, and a commit that cannot tell them apart raises only
+    # against the real thing.
+    for holder, cls in (
+        ("load_inquirer", SchedulerLoadInquirer),
+        ("kv_events_publisher", SchedulerKvEventsPublisher),
+    ):
+        fields = {f.name: MagicMock() for f in dataclasses.fields(cls) if f.init}
+        fields["max_running_requests"] = 128
+        if "kv_events_config" in fields:
+            fields["kv_events_config"] = None  # keeps __post_init__ inert
+        setattr(s, holder, cls(**fields))
     return s
 
 
