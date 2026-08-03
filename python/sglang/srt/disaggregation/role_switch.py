@@ -76,8 +76,7 @@ def handle_pd_role_switch(
             scheduler.server_args.override(
                 "role_switch.flip", disaggregation_mode=new_role
             )
-            # server_args stays the pristine launch record; init_disaggregation and
-            # the scheduling policy rebuild from the bag, so both stores are written.
+            # The rebuild and the scheduling policy read the bag, not server_args.
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
         except Exception as e:
