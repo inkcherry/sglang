@@ -494,6 +494,10 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_kv_cache_and_memory_pool()
+        # The builder settles the cache class; a flip into decode overwrites it and
+        # flipping back restores this. Capture here, not in the builder, which the
+        # reconcile calls again.
+        self._pd_role_switch_launch_disable_radix_cache = self.disable_radix_cache
 
         if _is_npu and is_deepseek_v4(
             self.tp_worker.model_runner.model_config.hf_config
@@ -921,8 +925,6 @@ class Scheduler(
         ) = self.tp_worker.get_worker_info()
         # The ceiling the role-switch reconcile clamps every target admit cap to.
         self._pd_role_switch_launch_cap = self.max_running_requests
-        # A flip into decode overwrites the cache class; flipping back restores this.
-        self._pd_role_switch_launch_disable_radix_cache = self.disable_radix_cache
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
