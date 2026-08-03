@@ -102,8 +102,6 @@ def handle_pd_role_switch(
 
 
 class RoleTargets(msgspec.Struct, frozen=True):
-    """Everything the target role needs, derived before anything is written."""
-
     max_running_requests: int
     chunked_prefill_size: Optional[int]
     # Per-rank a2a dispatch capacity; None means this rank could not derive one.
@@ -119,7 +117,8 @@ def reconcile_role_config(
     Split into a pure derive, then the one fallible step, then infallible
     writes. The a2a buffer must be sized from the SETTLED cap and chunk size,
     or it gets sized for the role being left; putting every write after the
-    resize is what makes a failed flip leave nothing half-applied.
+    resize is what makes a failed flip leave nothing half-applied. The prefix
+    cache needs no step: its class is operator config, not role-derived.
     """
     from sglang.srt.layers.moe.token_dispatcher.moriep import (
         rebuild_mori_dispatch_buffers,
@@ -142,8 +141,7 @@ def _derive_targets(
     )
     chunk = recv_req.chunked_prefill_size or sa.chunked_prefill_size
     if new_role == "prefill":
-        # A dynamic chunker may predict a larger chunk than today's, so size to
-        # its ceiling instead.
+        # A dynamic chunker may predict a bigger chunk; size to its ceiling.
         dispatch_tokens = (
             chunk
             if chunk and chunk > 0 and not scheduler.enable_dynamic_chunking
@@ -168,10 +166,10 @@ def _pad_to_captured_bucket(
     batch_size: int, capture_bs: Sequence[int]
 ) -> Optional[int]:
     """The batch the a2a actually sees: a CUDA-graph replay pads up to the
-    smallest captured bucket first. Must come from the runner's LIVE list --
-    the declared ladder is filtered for alignment, and removing a bucket
-    promotes the pad to the next one UP, so guessing under-sizes the buffer.
-    mori has no runtime bounds check, so an under-size is silent out-of-bounds.
+    smallest captured bucket first. `capture_bs` must be the runner's LIVE
+    list -- the declared ladder is filtered for alignment, and dropping a
+    bucket promotes the pad to the next one UP. mori has no runtime bounds
+    check, so guessing low is a silent out-of-bounds write.
     """
     buckets = [b for b in capture_bs if b >= batch_size]
     if not buckets:
@@ -194,11 +192,11 @@ def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
 
 
 # Components that CAPTURE max_running_requests as a field instead of reading it
-# off the scheduler per use, so a flip has to restamp them by name.
+# off the scheduler per use, so a flip has to restamp them by name. PrefillAdder
+# also captures it but is rebuilt per batch, so it picks the new value up itself.
 _MAX_RUNNING_REQUESTS_HOLDERS = (
     ("load_inquirer", "max_running_requests"),
     ("kv_events_publisher", "max_running_requests"),
-    ("policy", "max_running_requests"),
 )
 
 _MOE_MAX_INPUT_TOKENS = "SGLANG_MORI_MOE_MAX_INPUT_TOKENS"
