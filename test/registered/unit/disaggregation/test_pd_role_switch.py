@@ -14,6 +14,11 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.model_executor.cuda_graph_config import (  # noqa: E402
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (  # noqa: E402
     SchedulerKvEventsPublisher,
 )
@@ -65,6 +70,8 @@ def _make_scheduler(mode, *, enable=True, idle=True):
     s._pd_role_switch_unhealthy = False
     s.tp_worker = MagicMock()
     s.tp_worker.get_decode_cuda_graph_bs.return_value = [64, 128, 256]
+    # As a prefill instance is launched: decode graphs off until the first flip.
+    sa.cuda_graph_config = CudaGraphConfig(decode=PhaseConfig(backend=Backend.DISABLED))
     sa.max_prefill_tokens = 16384
     sa.speculative_num_draft_tokens = None
     s.max_running_requests = 128
