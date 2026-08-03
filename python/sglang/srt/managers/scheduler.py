@@ -494,9 +494,8 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_kv_cache_and_memory_pool()
-        # The builder settles the cache class; a flip into decode overwrites it and
-        # flipping back restores this. Capture here, not in the builder, which the
-        # reconcile calls again.
+        # Flipping back restores this. Not captured inside the builder above: the
+        # reconcile calls it again per role and would overwrite the launch value.
         self._pd_role_switch_launch_disable_radix_cache = self.disable_radix_cache
 
         if _is_npu and is_deepseek_v4(
