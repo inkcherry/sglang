@@ -266,10 +266,8 @@ class TestRoleConfigReconcile(unittest.TestCase):
         self.assertTrue(out.success)
         resize.assert_called_once_with(2048, "prefill")
         self.assertEqual(s.chunked_prefill_size, 2048)
-        # The per-step chunk truncation reads the bag, not the scheduler field.
         self.assertEqual(runtime_context.get_schedule().chunked_prefill_size, 2048)
-        # And it stays settled: a flip that does not restate the chunk must not
-        # resurrect the launch value off the pristine server_args.
+        # A flip that does not restate the chunk must not resurrect the launch value.
         s.disaggregation_mode = DisaggregationMode.PREFILL
         with patch.object(moriep, "rebuild_mori_dispatch_buffers"):
             Scheduler.handle_pd_role_switch(s, PdRoleSwitchReqInput(new_role="decode"))
