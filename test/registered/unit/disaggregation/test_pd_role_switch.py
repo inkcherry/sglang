@@ -401,6 +401,21 @@ class TestMoriA2AResize(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._resize(512, [512])
 
+    def test_refusal_after_an_earlier_op_resized_is_group_dead(self):
+        """A clean refusal is only recoverable while nothing has been applied.
+        `init_mori_op` is cached per config, so a process can hold more than one
+        op, and once an earlier one is resized no single token count serves
+        both — reported as an ordinary refusal, the caller resumes the old role
+        over a buffer that is already the new size."""
+        second = MagicMock(spec=["reconfigure"])
+        second.reconfigure.side_effect = ValueError("rejected")
+        moriep._LIVE_OPS.append(
+            moriep._LiveOp(op=second, group=MagicMock(), rank=0, capacity=4096)
+        )
+        with self.assertRaises(moriep.MoriA2AGroupDead):
+            self._resize(512, [512])
+        self.assertEqual(moriep._LIVE_OPS[0].capacity, 512)
+
 
 class TestPdRoleSwitchReqSerialization(unittest.TestCase):
     """Guard the wire contract of the /pd_role_switch req/resp structs.
