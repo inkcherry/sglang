@@ -127,6 +127,10 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
 
     view = resolved_view(server_args)
+    # Built for the launch role only, and a flip neither rebuilds nor tears them
+    # down, so the knob would silently stop applying.
+    offload = view.disaggregation_decode_enable_offload_kvcache
+    delayer = view.enable_prefill_delayer
     unsupported = [
         item
         for present, item in (
@@ -138,6 +142,12 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
             ),
             (view.pp_size > 1, f"pipeline parallelism (--pp-size {view.pp_size})"),
             (view.dp_size > 1, f"data parallelism (--dp-size {view.dp_size})"),
+            (
+                offload,
+                "decode KV offload "
+                "(--disaggregation-decode-enable-offload-kvcache)",
+            ),
+            (delayer, "the prefill delayer (--enable-prefill-delayer)"),
         )
         if present
     ]
@@ -146,7 +156,13 @@ def check_pd_role_switch_support(server_args: ServerArgs) -> None:
     # together — anything else present keeps the whole configuration rejected.
     gate = server_args.enable_pd_role_switch_experimental_moe
     ep_over_mori = view.ep_size > 1 and view.moe_a2a_backend == "mori"
-    others = view.enable_dp_attention or view.pp_size > 1 or view.dp_size > 1
+    others = (
+        view.enable_dp_attention
+        or view.pp_size > 1
+        or view.dp_size > 1
+        or offload
+        or delayer
+    )
     if gate and ep_over_mori and not others:
         logger.warning(
             "EXPERIMENTAL: PD role switch with expert parallelism "
