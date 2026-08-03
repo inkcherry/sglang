@@ -78,6 +78,10 @@ def handle_pd_role_switch(
             scheduler.server_args.override(
                 "role_switch.flip", disaggregation_mode=new_role
             )
+            # Both stores are read: server_args above by the compile/readback
+            # paths, the bag here by init_disaggregation and the scheduling
+            # policy. Without this the rebuild reads the LAUNCH role back.
+            get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
