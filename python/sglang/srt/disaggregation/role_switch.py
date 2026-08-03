@@ -116,16 +116,17 @@ def _capture_decode_cuda_graphs(
     A prefill instance launched with the decode graph disabled is the normal PD
     launch, and its bucket ladder can filter down to empty -- which the capture
     treats as fatal. Refusing the flip there makes the feature unusable, so fall
-    back to eager. The runner turns the graph on before it can fail, so undo
-    that; its server_args stamp needs no undo, no live reader consults it.
+    back to eager. The runner edits the decode phase config in place before it
+    can fail, so restore a pre-call copy of the whole phase; its server_args
+    stamp needs no undo, no live reader consults it.
     """
     cfg = scheduler.server_args.cuda_graph_config
-    decode_backend = None if cfg is None else cfg.decode.backend
+    decode_cfg = None if cfg is None else dataclasses.replace(cfg.decode)
     try:
         scheduler.tp_worker.ensure_decode_cuda_graphs(capture_bs)
     except Exception as e:
         if cfg is not None:
-            cfg.decode.backend = decode_backend
+            cfg.decode = decode_cfg
         logger.warning(
             "PD role switch: decode CUDA graph capture failed (%s); "
             "the flipped instance will decode eagerly",
