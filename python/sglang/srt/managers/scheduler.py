@@ -997,12 +997,12 @@ class Scheduler(
             )
 
     def init_kv_cache_and_memory_pool(self) -> None:
-        """Build the prefix cache and bind every holder of it.
+        """Build the prefix cache and bind the holders of it.
 
-        Re-runnable: a PD role switch calls this to rebuild the tree cache into
-        the new role's class, so every holder must be (re)bound here and nowhere
-        else. The memory pools themselves are owned by the worker and are
-        returned, not reallocated.
+        Re-runnable: a PD role switch calls this again to rebuild the tree cache
+        into the new role's class, so a new holder belongs here and not at the
+        call site. The pools are owned by the worker and returned, not
+        reallocated.
         """
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,

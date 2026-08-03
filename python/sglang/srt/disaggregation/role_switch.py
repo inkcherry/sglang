@@ -341,10 +341,10 @@ def _rebuild_prefix_cache_for_role(scheduler: Scheduler) -> None:
 
     Rebuilding rather than resetting is what makes the class role-correct:
     radix vs chunk is decided per role, so a reset-in-place leaves a flipped
-    instance serving the class it launched with. The build rebinds every holder
-    of the tree; the schedule policy is re-derived because a longest-prefix
-    policy is not valid against a chunk cache, and the session controller
-    captured the tree as a field.
+    instance serving the class it launched with. The two holders that captured
+    the tree as a field are restamped here; the rest are rebound by the build.
+    A longest-prefix policy is not valid against a chunk cache, so the schedule
+    policy is re-derived rather than kept.
     """
     tree_cache = scheduler.tree_cache
     if tree_cache is not None and not scheduler.disable_radix_cache:
