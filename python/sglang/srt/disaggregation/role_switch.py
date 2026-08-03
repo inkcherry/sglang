@@ -240,8 +240,11 @@ def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
         os.environ.pop(_MOE_MAX_INPUT_TOKENS, None)
     else:
         os.environ[_MOE_MAX_INPUT_TOKENS] = targets.moe_max_input_tokens
-    # Read back by the cache rebuild in teardown, which runs after this.
-    scheduler.server_args.disable_radix_cache = targets.disable_radix_cache
+    # Read back by the cache rebuild in teardown, which runs after this. Bare
+    # assignment raises: server_args is read-only once the config is resolved.
+    scheduler.server_args.override(
+        "pd_role_switch.reconcile", disable_radix_cache=targets.disable_radix_cache
+    )
 
 
 _MOE_MAX_INPUT_TOKENS = "SGLANG_MORI_MOE_MAX_INPUT_TOKENS"
