@@ -7,6 +7,7 @@ Kept out of scheduler.py to avoid growing it further.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 from typing import TYPE_CHECKING, Optional, Sequence
@@ -191,22 +192,20 @@ def _commit_targets(scheduler: Scheduler, targets: RoleTargets) -> None:
     """Apply the settled values. Runs only after the resize succeeded, and
     nothing here can fail, so a flip is all-or-nothing."""
     scheduler.max_running_requests = targets.max_running_requests
-    for holder, attr in _MAX_RUNNING_REQUESTS_HOLDERS:
-        setattr(getattr(scheduler, holder), attr, targets.max_running_requests)
+    # Both components CAPTURE the cap as a field rather than reading it off the
+    # scheduler per use, so a flip has to restamp them. The inquirer is a frozen
+    # dataclass -- rebind a copy; nothing else holds a reference to it.
+    # PrefillAdder captures it too but is rebuilt per batch, so it self-updates.
+    scheduler.load_inquirer = dataclasses.replace(
+        scheduler.load_inquirer, max_running_requests=targets.max_running_requests
+    )
+    scheduler.kv_events_publisher.max_running_requests = targets.max_running_requests
     scheduler.chunked_prefill_size = targets.chunked_prefill_size
     if targets.moe_max_input_tokens is None:
         os.environ.pop(_MOE_MAX_INPUT_TOKENS, None)
     else:
         os.environ[_MOE_MAX_INPUT_TOKENS] = targets.moe_max_input_tokens
 
-
-# Components that CAPTURE max_running_requests as a field instead of reading it
-# off the scheduler per use, so a flip has to restamp them by name. PrefillAdder
-# also captures it but is rebuilt per batch, so it picks the new value up itself.
-_MAX_RUNNING_REQUESTS_HOLDERS = (
-    ("load_inquirer", "max_running_requests"),
-    ("kv_events_publisher", "max_running_requests"),
-)
 
 _MOE_MAX_INPUT_TOKENS = "SGLANG_MORI_MOE_MAX_INPUT_TOKENS"
 # The launcher exports one per role; the reconcile picks the target role's.
