@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os as _agos
 import time
 from array import array
 from collections import defaultdict, deque
@@ -15,6 +16,19 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+
+# EXPERIMENT: replace the pipelined 2-pass bootstrap consensus ring (which advances
+# 1 hop per micro-batch step, so a rid needs ~2*pp_size forward-gated steps -> ~8s
+# TTFT) with a single one-shot pp_group all-gather that reaches identical consensus
+# in one step. Gated so we can A/B and fall back to the ring.
+_PP_ALLGATHER = _agos.environ.get("SGLANG_PP_ALLGATHER_CONSENSUS", "0") not in (
+    "0", "", "false", "False",
+)
+# DEBUG: throttled pipeline-occupancy log to see if the forward pipeline is starved
+# while requests sit in bootstrap-wait (poll==None, PP consensus undecided).
+_PP_UTIL_LOG = _agos.environ.get("SGLANG_PP_UTIL_LOG", "0") not in (
+    "0", "", "false", "False",
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -24,7 +38,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -36,6 +50,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
@@ -122,7 +137,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                if self.server_args.pp_async_batch_depth > 0:
+                if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -138,7 +153,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if self.server_args.pp_async_batch_depth == 0:
+                if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -244,9 +259,15 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
-                bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
+                if _PP_ALLGATHER:
+                    # all-gather consensus runs at the END of the loop body (after
+                    # all async point-to-point sends are issued) to avoid a barrier-
+                    # vs-staggered-ring deadlock. Skip the ring here entirely.
+                    bootstrapped_rids = None
+                else:
+                    bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                    bmbs[mb_id] = bootstrapped_rids
+                    self._pp_commit_comm_work(send_bootstrapped_work)
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
@@ -268,7 +289,7 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                if self.server_args.pp_async_batch_depth > 0:
+                if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -284,21 +305,22 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if self.server_args.pp_async_batch_depth == 0:
+                if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
                         )
                     )
-                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
-                        bootstrapped_rids,
+                if not _PP_ALLGATHER:
+                    send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
+                        self._pp_pd_send_consensus_bootstrapped_ids(
+                            bmbs,
+                            next_first_rank_mb_id,
+                            consensus_bootstrapped_rids,
+                            bootstrapped_rids,
+                        )
                     )
-                )
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
@@ -331,9 +353,10 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
+                    if not _PP_ALLGATHER:
+                        send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                            bootstrapped_rids, async_send=True
+                        )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -351,7 +374,35 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
+                if _PP_ALLGATHER:
+                    # one-shot cross-rank consensus, placed after all async sends of
+                    # this iteration are issued so no rank blocks the request/proxy
+                    # rings while others wait at the collective. Admitted reqs land
+                    # in waiting_queue and are scheduled next iteration.
+                    self.process_bootstrapped_queue(
+                        self._pp_pd_allgather_consensus_bootstrapped()
+                    )
+
                 self.running_batch.batch_is_full = False
+
+                self._pp_step_ctr = getattr(self, "_pp_step_ctr", 0) + 1
+                if _PP_UTIL_LOG and self.pp_group.is_first_rank:
+                    if time.perf_counter() - getattr(self, "_util_last", 0) > 1.0:
+                        self._util_last = time.perf_counter()
+                        _rb = (
+                            len(self.running_batch.reqs)
+                            if self.running_batch is not None
+                            and self.running_batch.reqs is not None
+                            else 0
+                        )
+                        logger.info(
+                            "[pp-util] step=%d bootstrap_q=%d waiting_q=%d running=%d inflight=%d",
+                            self._pp_step_ctr,
+                            len(self.disagg_prefill_bootstrap_queue.queue),
+                            len(self.waiting_queue),
+                            _rb,
+                            len(self.disagg_prefill_inflight_queue),
+                        )
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
@@ -427,7 +478,7 @@ class SchedulerPPMixin:
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # early send output if possible
-                if self.server_args.pp_async_batch_depth > 0:
+                if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -445,7 +496,7 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
-                if self.server_args.pp_async_batch_depth == 0:
+                if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -479,7 +530,7 @@ class SchedulerPPMixin:
                     )
                 )
 
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                if get_disagg().disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
                 if rmbs[next_mb_id] is not None:
@@ -549,17 +600,17 @@ class SchedulerPPMixin:
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
             )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
+        self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
-            not self.server_args.enable_dsa_prefill_context_parallel
+            not get_parallel().enable_dsa_prefill_context_parallel
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
@@ -714,12 +765,14 @@ class SchedulerPPMixin:
                 seq_lens.append(len(input_ids))
                 latencies.append(latency_ms)
 
-                # Release KV cache
+                # Release KV and Mamba cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
+                    if req.mamba_pool_idx is not None:
+                        self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
                     req.kv = None
 
@@ -809,8 +862,8 @@ class SchedulerPPMixin:
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids
-                    + bad_consensus_bootstrapped_rids,
+                    pp_good_rids=good_consensus_bootstrapped_rids,
+                    pp_bad_rids=bad_consensus_bootstrapped_rids,
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -845,7 +898,47 @@ class SchedulerPPMixin:
             bad_bootstrapped_rids = list(
                 set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
             )
+        # Route locally-aborted reqs through the bad-union consensus so every PP
+        # rank flushes them in the same consensus round, regardless of when the
+        # AbortReq reaches each rank and regardless of whether
+        # disagg_kv_sender.abort() drives the poll to Failed (it is optional).
+        aborted_rids = {
+            req.rid
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if isinstance(req.finished_reason, FINISH_ABORT)
+        }
+        good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
+            good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
+        )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
+
+    def _pp_pd_allgather_consensus_bootstrapped(self: Scheduler):
+        # One-shot all-gather consensus: every rank contributes its LOCAL good/bad
+        # set, all ranks receive all sets and compute the SAME intersection(good)/
+        # union(bad). Reaches identical cross-rank agreement in a single collective
+        # instead of the 2*pp_size-step ring, so admission is not gated by the
+        # forward pipeline cadence. Must be called by every pp rank the same number
+        # of times per step (it is: once per get-bootstrapped point in the loop).
+        good, bad = self.get_rids(
+            self.disagg_prefill_bootstrap_queue.queue,
+            True,
+            [KVPoll.WaitingForInput],
+            [KVPoll.Failed],
+        )
+        aborted_rids = {
+            req.rid
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if isinstance(req.finished_reason, FINISH_ABORT)
+        }
+        good, bad = self._route_aborts_to_bad(good, bad, aborted_rids)
+        gathered = self.pp_group.all_gather_object([good, bad])
+        good_sets = [set(g) for g, b in gathered]
+        bad_sets = [set(b) for g, b in gathered]
+        consensus_bad = set().union(*bad_sets) if bad_sets else set()
+        consensus_good = (
+            set.intersection(*good_sets) if good_sets else set()
+        ) - consensus_bad
+        return [list(consensus_good), list(consensus_bad)]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -1367,7 +1460,30 @@ class SchedulerPPMixin:
             bad_prealloc_rids = list(
                 set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
             )
+        # Same abort routing as the prefill bootstrap consensus above.
+        aborted_rids = {
+            decode_req.req.rid
+            for decode_req in self.disagg_decode_prealloc_queue.queue
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+        }
+        good_prealloc_rids, bad_prealloc_rids = self._route_aborts_to_bad(
+            good_prealloc_rids, bad_prealloc_rids, aborted_rids
+        )
         return [good_prealloc_rids, bad_prealloc_rids]
+
+    @staticmethod
+    def _route_aborts_to_bad(good_rids, bad_rids, aborted_rids):
+        """Move aborted rids out of the good (intersection) set and into the
+        bad (union) set, so PP consensus fails them uniformly on every rank.
+
+        This also flushes aborted reqs that never reached good/bad consensus
+        (e.g. stuck in Bootstrapping with a sender that has no working abort()).
+        """
+        if not aborted_rids:
+            return good_rids, bad_rids
+        good_rids = [rid for rid in good_rids if rid not in aborted_rids]
+        bad_rids = list(set(bad_rids) | set(aborted_rids))
+        return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -1415,8 +1531,8 @@ class SchedulerPPMixin:
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
             good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
-                rids_to_check=good_consensus_prealloc_rids
-                + bad_consensus_prealloc_rids,
+                pp_good_rids=good_consensus_prealloc_rids,
+                pp_bad_rids=bad_consensus_prealloc_rids,
             )
             self.disagg_decode_transfer_queue.extend(good_reqs)
             return [
