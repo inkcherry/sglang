@@ -380,7 +380,6 @@ class Envs:
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     # Optional PP disaggregated-prefill admission flow.
     SGLANG_PP_PD_ADMIT_FLOW = EnvBool(False)
-    SGLANG_PP_PD_ADMIT_FLOW_MARGIN = EnvInt(1)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
