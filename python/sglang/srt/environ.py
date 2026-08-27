@@ -380,6 +380,9 @@ class Envs:
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     # Optional PP disaggregated-prefill admission flow.
     SGLANG_PP_PD_ADMIT_FLOW = EnvBool(False)
+    # Finish a prefill response when this rank's KV transfer completes. Memory
+    # remains allocated until the existing release ring reaches consensus.
+    SGLANG_PP_PD_LOCAL_RELEASE = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)

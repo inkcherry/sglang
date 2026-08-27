@@ -311,6 +311,7 @@ class KVCacheConfigurator:
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
                 max_num_reqs=sizes.max_running_requests
+                + self._prefill_transfer_slots(sizes.max_running_requests)
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -559,6 +560,12 @@ class KVCacheConfigurator:
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
+
+    def _prefill_transfer_slots(self, max_running_requests: int) -> int:
+        """Reserve request slots for completed prefills whose KV is in flight."""
+        if self.server_args.disaggregation_mode != "prefill":
+            return 0
+        return max_running_requests
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
@@ -1616,17 +1623,17 @@ class KVCacheConfigurator:
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
         ):
-            # Use explicitly set max_running_requests when radix cache is disabled
+            reqs_per_worker = server_args.max_running_requests // self.ps.attn_dp_size
             server_args.override(
                 "mamba_pool.from_max_running_requests",
-                max_mamba_cache_size=server_args.max_running_requests
-                // self.ps.attn_dp_size,
+                max_mamba_cache_size=reqs_per_worker
+                + self._prefill_transfer_slots(reqs_per_worker),
             )
-            # Reserve intermediate memory based on capped max_num_reqs
+            # In-flight transfers do not need speculative draft states.
             if has_spec_dec:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
+                    * reqs_per_worker
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
