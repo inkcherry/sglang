@@ -88,6 +88,7 @@ def init_dcp_pack_buffers(
     kv_args,
     count: int,
     dcp_size: int,
+    label: str = "PD DCP pack",
 ) -> List[StagingBuffer]:
     from sglang.srt.disaggregation.common.staging_handler import (
         _get_custom_mem_pool,
@@ -112,7 +113,8 @@ def init_dcp_pack_buffers(
         register_fn(buf.get_ptr(), buf.get_size())
         buffers.append(buf)
     logger.info(
-        "PD DCP pack buffers allocated: %d x %.1f MB (max_tokens=%d)",
+        "%s buffers allocated: %d x %.1f MB (max_tokens=%d)",
+        label,
         count,
         size_bytes / (1024 * 1024),
         max_tokens,

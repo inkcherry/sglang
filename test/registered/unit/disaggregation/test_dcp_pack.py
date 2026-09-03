@@ -1,10 +1,12 @@
 import unittest
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
     try_pack_dcp_src,
@@ -114,6 +116,30 @@ class TestTryDcpPack(CustomTestCase):
         pack_view = copy_mock.call_args.args[2]
         self.assertEqual(pack_view.storage_offset(), pack_offset)
         self.assertEqual(pack_view.numel(), src.size * item_len)
+
+    def test_mla_source_staging_packs_page_entries(self):
+        manager = object.__new__(CommonKVManager)
+        pack_buffer = Mock()
+        manager._mla_source_staging_buffers = [pack_buffer]
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x1000, 0x2000],
+            kv_item_lens=[256, 128],
+        )
+        page_indices = np.array([9, 2, 7], dtype=np.int32)
+
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
+            return_value=("packed", "indices"),
+        ) as pack_mock:
+            result = manager._pack_mla_source_pages(0, page_indices)
+
+        self.assertEqual(result, ("packed", "indices"))
+        pack_mock.assert_called_once_with(
+            pack_buffer=pack_buffer,
+            kv_data_ptrs=manager.kv_args.kv_data_ptrs,
+            src_token_indices=page_indices,
+            token_item_lens=manager.kv_args.kv_item_lens,
+        )
 
 
 if __name__ == "__main__":

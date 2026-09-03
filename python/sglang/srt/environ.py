@@ -740,6 +740,8 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Pack fragmented MLA source pages into contiguous per-worker GPU buffers.
+    SGLANG_DISAGG_MLA_SOURCE_STAGING = EnvBool(False)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)

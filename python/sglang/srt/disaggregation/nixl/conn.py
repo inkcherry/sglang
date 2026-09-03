@@ -488,6 +488,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            self._init_mla_source_staging_buffers()
             self.exceptions: Dict[int, Exception] = {}
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
@@ -1138,6 +1139,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # NIXL reads regions asynchronously; the chunk barrier prevents
                 # reuse until every transfer completes.
                 packed_source_by_dcp_rank = {}
+                packed_mla_source = None
+                packed_mla_page_count = -1
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -1269,6 +1272,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                         raise RuntimeError(
                                             "Missing NIXL destination KV memory kind"
                                         )
+                                    if (
+                                        self.enable_mla_source_staging
+                                        and (
+                                            self.is_mla_backend
+                                            or self.is_hybrid_mla_backend
+                                        )
+                                        and packed_mla_page_count
+                                        != len(src_prefill_kv_indices)
+                                    ):
+                                        packed_mla_source = self._pack_mla_source_pages(
+                                            worker_index, src_prefill_kv_indices
+                                        )
+                                        packed_mla_page_count = len(
+                                            src_prefill_kv_indices
+                                        )
                                     kv_xfer_handle = self.send_kvcache(
                                         req.agent_name,
                                         src_prefill_kv_indices,
@@ -1279,6 +1297,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                         dst_mem_kind=(
                                             dst_info.dst_homogeneous_mem_kind
                                         ),
+                                        packed_source=packed_mla_source,
                                     )
                                 else:
                                     handles.extend(
@@ -1658,14 +1677,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_gpu_id: int,
         notif: str,
         dst_mem_kind: str = "VRAM",
+        packed_source=None,
     ):
         assert self.src_mem_kind is not None
+        src_kv_ptrs = self.kv_args.kv_data_ptrs
+        src_kv_indices = prefill_kv_indices
+        if packed_source is not None:
+            src_kv_ptrs, src_kv_indices = packed_source
         return self._send_kvcache_generic(
             peer_name=peer_name,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            src_data_ptrs=src_kv_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
             item_lens=self.kv_args.kv_item_lens,
-            prefill_data_indices=prefill_kv_indices,
+            prefill_data_indices=src_kv_indices,
             dst_data_indices=dst_kv_indices,
             dst_gpu_id=dst_gpu_id,
             notif=notif,

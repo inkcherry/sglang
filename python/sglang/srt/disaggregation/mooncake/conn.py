@@ -237,6 +237,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            self._init_mla_source_staging_buffers()
             assert transfer_thread_pool_size >= transfer_queue_size, (
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
                 f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
@@ -873,6 +874,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        packed_source=None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -888,12 +890,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 compression_ratios = compression_ratios[start:end]
             c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
             dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
+        src_kv_ptrs = self.kv_args.kv_data_ptrs
+        src_kv_indices = prefill_kv_indices
+        if packed_source is not None:
+            src_kv_ptrs, src_kv_indices = packed_source
+
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            src_data_ptrs=src_kv_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
             item_lens=self.kv_args.kv_item_lens,
-            prefill_data_indices=prefill_kv_indices,
+            prefill_data_indices=src_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
             src_layer_ids=self.kv_args.kv_layer_ids,
@@ -1707,6 +1714,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
+                packed_mla_source = None
+                packed_mla_page_count = -1
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
@@ -1821,6 +1830,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
+                            if (
+                                self.enable_mla_source_staging
+                                and (self.is_mla_backend or self.is_hybrid_mla_backend)
+                                and packed_mla_page_count
+                                != len(kv_chunk.prefill_kv_indices)
+                            ):
+                                packed_mla_source = self._pack_mla_source_pages(
+                                    worker_index, kv_chunk.prefill_kv_indices
+                                )
+                                packed_mla_page_count = len(kv_chunk.prefill_kv_indices)
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1831,6 +1850,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                packed_source=packed_mla_source,
                             )
                         elif (
                             self.enable_staging

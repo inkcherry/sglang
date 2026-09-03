@@ -168,6 +168,11 @@ class CommonKVManager(BaseKVManager):
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
         self._dcp_pack_buffers = None
+        self._mla_source_staging_buffers = None
+        self.enable_mla_source_staging = (
+            envs.SGLANG_DISAGG_MLA_SOURCE_STAGING.get()
+            and (self.is_mla_backend or self.is_hybrid_mla_backend)
+        )
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
@@ -357,6 +362,33 @@ class CommonKVManager(BaseKVManager):
             self.kv_args,
             len(self.transfer_queues),
             dcp_size,
+        )
+
+    def _init_mla_source_staging_buffers(self) -> None:
+        if self._mla_source_staging_buffers is not None:
+            return
+        if not self.enable_mla_source_staging or not self.kv_args.kv_item_lens:
+            return
+        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+
+        self._mla_source_staging_buffers = init_dcp_pack_buffers(
+            self._register_staging_memory,
+            self.kv_args,
+            len(self.transfer_queues),
+            dcp_size=1,
+            label="PD MLA source staging",
+        )
+
+    def _pack_mla_source_pages(self, worker_index: int, page_indices):
+        if not self._mla_source_staging_buffers:
+            return None
+        from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+        return try_pack_dcp_src(
+            pack_buffer=self._mla_source_staging_buffers[worker_index],
+            kv_data_ptrs=self.kv_args.kv_data_ptrs,
+            src_token_indices=page_indices,
+            token_item_lens=self.kv_args.kv_item_lens,
         )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:

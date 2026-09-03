@@ -306,6 +306,7 @@ class MoriKVManager(CommonKVManager):
         self.kv_mem_descs: List[MemoryDesc] = []
         self.aux_mem_descs: List[MemoryDesc] = []
         self.state_mem_descs: List[List[MemoryDesc]] = []
+        self._staging_mem_descs: Dict[int, MemoryDesc] = {}
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
@@ -316,6 +317,8 @@ class MoriKVManager(CommonKVManager):
             self._transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(self._num_shards)
             ]
+            self.transfer_queues = self._transfer_queues
+            self._init_mla_source_staging_buffers()
             self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
             self._room_status_notified: Dict[int, bool] = {}
@@ -323,7 +326,7 @@ class MoriKVManager(CommonKVManager):
             for shard, queue in enumerate(self._transfer_queues):
                 threading.Thread(
                     target=self._transfer_worker,
-                    args=(queue,),
+                    args=(queue, shard),
                     daemon=True,
                     name=(
                         f"mori-xfer-dp{self.system_dp_rank}-"
@@ -335,6 +338,14 @@ class MoriKVManager(CommonKVManager):
             self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
             self._start_heartbeat_checker_thread()
+
+    def _register_staging_memory(self, ptr: int, size: int) -> None:
+        self._staging_mem_descs[ptr] = self.engine.register_memory(
+            ptr,
+            size,
+            self.kv_args.gpu_id,
+            MemoryLocationType.GPU,
+        )
 
     def _init_engine(self) -> IOEngine:
         if self.kv_args.ib_device:
@@ -423,11 +434,11 @@ class MoriKVManager(CommonKVManager):
             return
         super().update_status(bootstrap_room, status)
 
-    def _transfer_worker(self, queue: FastQueue) -> None:
+    def _transfer_worker(self, queue: FastQueue, worker_index: int) -> None:
         while True:
             kv_chunk = queue.get()
             try:
-                self._process_transfer_chunk(kv_chunk)
+                self._process_transfer_chunk(kv_chunk, worker_index)
             except Exception as exc:
                 failure_reason = f"transfer worker raised: {exc!r}"
                 try:
@@ -448,7 +459,9 @@ class MoriKVManager(CommonKVManager):
                     except Exception:
                         pass
 
-    def _process_transfer_chunk(self, kv_chunk: TransferKVChunk) -> None:
+    def _process_transfer_chunk(
+        self, kv_chunk: TransferKVChunk, worker_index: int
+    ) -> None:
         room = kv_chunk.room
         if self._should_skip_transfer(room):
             return
@@ -466,6 +479,7 @@ class MoriKVManager(CommonKVManager):
             kv_chunk.is_last_chunk,
             aux_index=kv_chunk.prefill_aux_index,
             state_indices=kv_chunk.state_indices,
+            worker_index=worker_index,
         )
 
         if self._should_skip_transfer(room):
@@ -980,10 +994,35 @@ class MoriKVManager(CommonKVManager):
         return statuses
 
     def _build_contiguous_transfer_plan(
-        self, grouped_plan: GroupedIndexPlan, item_len: int
+        self,
+        grouped_plan: GroupedIndexPlan,
+        item_len: int,
+        local_base_offset: int = 0,
     ) -> BatchTransferPlan:
         # Reuse grouped indices across all layers/tensors that share the same item length.
-        return grouped_plan.materialize(item_len)
+        plan = grouped_plan.materialize(item_len)
+        if local_base_offset:
+            return BatchTransferPlan(
+                local_offsets=[
+                    local_base_offset + offset for offset in plan.local_offsets
+                ],
+                remote_offsets=plan.remote_offsets,
+                sizes=plan.sizes,
+            )
+        return plan
+
+    def _pack_mla_source_for_mori(self, worker_index: int, page_indices):
+        packed = self._pack_mla_source_pages(worker_index, page_indices)
+        if packed is None:
+            return None
+        packed_ptrs, dense_indices = packed
+        buffer = self._mla_source_staging_buffers[worker_index]
+        base_ptr = buffer.get_ptr()
+        return (
+            self._staging_mem_descs[base_ptr],
+            [ptr - base_ptr for ptr in packed_ptrs],
+            dense_indices,
+        )
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
         page_size = self.kv_args.page_size
@@ -1102,10 +1141,14 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
+        packed_source=None,
     ) -> List[TransferStatus]:
+        src_kv_indices = prefill_kv_indices
+        if packed_source is not None:
+            _, _, src_kv_indices = packed_source
         grouped_plan = GroupedIndexPlan.from_groups(
             *group_concurrent_contiguous(
-                prefill_kv_indices,
+                src_kv_indices,
                 dst_kv_indices,
             )
         )
@@ -1116,13 +1159,31 @@ class MoriKVManager(CommonKVManager):
             src_descs, dst_descs, layers_current_pp_stage = (
                 self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             )
+            staging_desc = None
+            staging_offsets = None
+            if packed_source is not None:
+                staging_desc, staging_offsets, _ = packed_source
+                if len(staging_offsets) < layers_current_pp_stage:
+                    raise ValueError(
+                        "Packed MLA source has fewer regions than the PP stage"
+                    )
             for layer_id in range(layers_current_pp_stage):
                 layer_plan = self._build_contiguous_transfer_plan(
-                    grouped_plan, self.kv_args.kv_item_lens[layer_id]
+                    grouped_plan,
+                    self.kv_args.kv_item_lens[layer_id],
+                    (
+                        staging_offsets[layer_id]
+                        if staging_offsets is not None
+                        else 0
+                    ),
                 )
                 statuses.extend(
                     self._submit_batch_transfer_plan(
-                        src_descs[layer_id],
+                        (
+                            staging_desc
+                            if staging_desc is not None
+                            else src_descs[layer_id]
+                        ),
                         dst_descs[layer_id],
                         layer_plan,
                     )
@@ -1536,6 +1597,7 @@ class MoriKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[npt.NDArray[np.int32]]] = None,
+        worker_index: int = 0,
     ) -> Tuple[List[TransferStatus], Optional[List[TransferInfo]]]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
 
@@ -1571,6 +1633,9 @@ class MoriKVManager(CommonKVManager):
 
         result_statuses: List[TransferStatus] = []
         try:
+            packed_source = self._pack_mla_source_for_mori(
+                worker_index, kv_indices
+            )
             for target in targets:
                 info = target.info
                 peer_info = target.peer_info
@@ -1578,7 +1643,12 @@ class MoriKVManager(CommonKVManager):
                 if not info.is_dummy:
                     dst_indices_chunk = info.dst_kv_indices[index_slice]
                     result_statuses.extend(
-                        self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+                        self.send_kvcache(
+                            peer_info,
+                            kv_indices,
+                            dst_indices_chunk,
+                            packed_source=packed_source,
+                        )
                     )
 
                 if (
