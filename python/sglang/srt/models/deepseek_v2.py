@@ -865,6 +865,16 @@ class DeepseekV2MoE(nn.Module):
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
 
+    def refresh_weight_dependent_state(self):
+        correction_bias = self.gate.e_score_correction_bias
+        topk_config = getattr(self.topk, "topk_config", None)
+        if topk_config is not None:
+            topk_config.correction_bias = correction_bias
+        if hasattr(self, "correction_bias"):
+            self.correction_bias = (
+                correction_bias.data if correction_bias is not None else None
+            )
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.

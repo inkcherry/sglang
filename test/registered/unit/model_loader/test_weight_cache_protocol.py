@@ -22,6 +22,7 @@ import socket
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -149,6 +150,7 @@ class TestTransportBackend(CustomTestCase):
                 a,
                 config={"k": "v"},
                 entries=entries,
+                module_metadata={"layers.0.mlp.experts": {"intermediate_pad": 0}},
                 pid=123,
                 preloaded_weights_bytes=65536,
             )
@@ -158,9 +160,187 @@ class TestTransportBackend(CustomTestCase):
             self.assertTrue(torch.equal(imported.cpu(), state_tensors["x"][0]))
             self.assertEqual(resp["transport_backend"], TORCH_IPC_BACKEND)
             self.assertEqual(resp["preloaded_weights_bytes"], 65536)
+            self.assertEqual(
+                resp["module_metadata"],
+                {"layers.0.mlp.experts": {"intermediate_pad": 0}},
+            )
         finally:
             a.close()
             b.close()
+
+
+class TestIpcPostprocessMetadata(CustomTestCase):
+    def test_daemon_exports_mxfp4_metadata(self):
+        from sglang.srt.weight_cache import daemon
+
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        model.experts.quant_method = SimpleNamespace(is_fp4_expert=True)
+        model.experts.intermediate_pad = 0
+        model.experts.hidden_pad = 0
+        weight = torch.nn.Parameter(torch.ones(2), requires_grad=False)
+        weight.is_shuffled = True
+        model.experts.register_parameter("w13_weight", weight)
+        model.cache_a = torch.nn.Module()
+        model.cache_b = torch.nn.Module()
+        shared_cache = torch.ones(2)
+        model.cache_a.register_buffer("freqs_cis", shared_cache, persistent=False)
+        model.cache_b.register_buffer("freqs_cis", shared_cache, persistent=False)
+
+        backend = SimpleNamespace(
+            name="test",
+            prepare_export=lambda state: {
+                name: {
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype).removeprefix("torch."),
+                    "is_param": is_param,
+                }
+                for name, (tensor, is_param) in state.items()
+            },
+        )
+        cache = daemon.WeightCacheDaemon.__new__(daemon.WeightCacheDaemon)
+        cache.gpu_id = 0
+        cache.model = model
+        cache.state_entries = {}
+        cache.module_metadata = {}
+        with mock.patch.object(
+            daemon, "choose_daemon_transport_backend", return_value=backend
+        ):
+            cache._export_state()
+
+        entry = cache.state_entries["experts.w13_weight"]
+        self.assertEqual(entry["postprocess_layout"], "mxfp4_moe")
+        self.assertEqual(entry["tensor_metadata"], {"is_shuffled": True})
+        self.assertIn("cache_a.freqs_cis", cache.state_entries)
+        self.assertIn("cache_b.freqs_cis", cache.state_entries)
+        self.assertEqual(
+            cache.module_metadata["experts"],
+            {"intermediate_pad": 0, "hidden_pad": 0},
+        )
+
+    def test_set_module_tensor_restores_tensor_metadata(self):
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        model = torch.nn.Module()
+        model.register_parameter(
+            "weight",
+            torch.nn.Parameter(torch.empty(2, device="meta"), requires_grad=False),
+        )
+        IpcModelLoader._set_module_tensor(
+            model,
+            "weight",
+            torch.ones(2),
+            tensor_metadata={"is_shuffled": True},
+        )
+        self.assertTrue(model.weight.is_shuffled)
+        self.assertTrue(torch.equal(model.weight, torch.ones(2)))
+
+    def test_restore_module_metadata(self):
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        IpcModelLoader._restore_module_metadata(
+            model,
+            {"experts": {"intermediate_pad": 128, "hidden_pad": 0}},
+        )
+        self.assertEqual(model.experts.intermediate_pad, 128)
+        self.assertEqual(model.experts.hidden_pad, 0)
+
+    def test_rebuilds_compressor_freqs_cis_alias(self):
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        class CacheModule(torch.nn.Module):
+            def refresh_mhc_norm_weight_cache(self):
+                self.refreshed = True
+
+            def refresh_weight_dependent_state(self):
+                self.runtime_state_refreshed = True
+
+        model = torch.nn.Module()
+        model.attn = torch.nn.Module()
+        model.attn.register_buffer("freqs_cis", torch.ones(2), persistent=False)
+        model.attn.compressor = torch.nn.Module()
+        model.attn.compressor.freqs_cis = torch.empty(2, device="meta")
+        model.attn.compressor.ape_converted = False
+        model.cache = CacheModule()
+        model.cache.refreshed = False
+        model.cache.runtime_state_refreshed = False
+
+        IpcModelLoader._rebuild_stale_views(model)
+
+        self.assertIs(model.attn.compressor.freqs_cis, model.attn.freqs_cis)
+        self.assertTrue(model.attn.compressor.ape_converted)
+        self.assertTrue(model.cache.refreshed)
+        self.assertTrue(model.cache.runtime_state_refreshed)
+
+    def test_deepseek_moe_refreshes_correction_bias_alias(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+        correction_bias = torch.nn.Parameter(torch.ones(2))
+        moe = SimpleNamespace(
+            gate=SimpleNamespace(e_score_correction_bias=correction_bias),
+            topk=SimpleNamespace(
+                topk_config=SimpleNamespace(
+                    correction_bias=torch.empty(2, device="meta")
+                )
+            ),
+        )
+
+        DeepseekV2MoE.refresh_weight_dependent_state(moe)
+
+        self.assertIs(
+            moe.topk.topk_config.correction_bias,
+            correction_bias,
+        )
+
+    def test_mxfp4_scale_postprocess_shape(self):
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        module = SimpleNamespace(quant_method=SimpleNamespace(is_fp4_expert=True))
+        reference = torch.empty(385, 7168, 12, dtype=torch.uint8, device="meta")
+        imported = torch.empty(385 * 7168, 16, dtype=torch.uint8, device="meta")
+        self.assertTrue(
+            IpcModelLoader._matches_mxfp4_moe_postprocess(
+                module, "w2_weight_scale_inv", imported, reference
+            )
+        )
+        self.assertFalse(
+            IpcModelLoader._matches_mxfp4_moe_postprocess(
+                module,
+                "w2_weight_scale_inv",
+                torch.empty(385 * 7168, 15, dtype=torch.uint8, device="meta"),
+                reference,
+            )
+        )
+
+    def test_mxfp4_weight_postprocess_dtype(self):
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4_dtype is None:
+            self.skipTest("torch build has no packed FP4 dtype")
+        module = SimpleNamespace(quant_method=SimpleNamespace(is_fp4_expert=True))
+        reference = SimpleNamespace(shape=(385, 768, 3584), dtype=torch.int8)
+        imported = SimpleNamespace(shape=reference.shape, dtype=fp4_dtype)
+        self.assertTrue(
+            IpcModelLoader._matches_mxfp4_moe_postprocess(
+                module, "w13_weight", imported, reference
+            )
+        )
+
+    def test_unknown_metadata_is_rejected(self):
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        model = torch.nn.Module()
+        model.register_parameter("weight", torch.nn.Parameter(torch.ones(1)))
+        with self.assertRaises(RuntimeError):
+            IpcModelLoader._set_module_tensor(
+                model,
+                "weight",
+                torch.ones(1),
+                tensor_metadata={"weight_loader": "unsafe"},
+            )
 
 
 class TestCacheConfig(CustomTestCase):

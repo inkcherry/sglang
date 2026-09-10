@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 # How often the client polls the serving daemon's PID for liveness.
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
+_IPC_TENSOR_ATTRS = {"is_shuffled", "format_ue8m0"}
+_IPC_MODULE_ATTRS = {"intermediate_pad", "hidden_pad"}
+_MXFP4_MOE_WEIGHTS = {"w13_weight", "w2_weight"}
+_MXFP4_MOE_SCALES = {"w13_weight_scale_inv", "w2_weight_scale_inv"}
 
 
 class IpcModelLoader(BaseModelLoader):
@@ -154,6 +158,7 @@ class IpcModelLoader(BaseModelLoader):
             device_config,
             entries,
             quant_config,
+            cache_data.get("module_metadata", {}),
         )
         self.preloaded_weights_bytes = preloaded_weights_bytes
 
@@ -191,6 +196,13 @@ class IpcModelLoader(BaseModelLoader):
         thread polls the daemon PID and, on death, SIGKILLs this process with a
         clear message instead of letting it serve corrupt results.
         """
+        if os.environ.get("SGLANG_WEIGHT_CACHE_DISABLE_LIVENESS_WATCHDOG") == "1":
+            logger.warning(
+                "[IpcModelLoader] Daemon-liveness watchdog disabled by "
+                "SGLANG_WEIGHT_CACHE_DISABLE_LIVENESS_WATCHDOG=1."
+            )
+            return
+
         if not daemon_pid or daemon_pid <= 0:
             logger.warning(
                 "[IpcModelLoader] Daemon did not report a PID; skipping the "
@@ -268,11 +280,37 @@ class IpcModelLoader(BaseModelLoader):
                         attn.bias = conv1d.bias
                     count += 1
 
+            freqs_cis = module._buffers.get("freqs_cis")
+            if freqs_cis is not None and freqs_cis.device.type != "meta":
+                for child_name in ("compressor", "indexer"):
+                    child = getattr(module, child_name, None)
+                    if (
+                        child is not None
+                        and getattr(child, "freqs_cis", None) is not None
+                    ):
+                        child.freqs_cis = freqs_cis
+                        count += 1
+
+            if hasattr(module, "ape_converted"):
+                module.ape_converted = True
+
+            refresh_norm_cache = getattr(module, "refresh_mhc_norm_weight_cache", None)
+            if refresh_norm_cache is not None:
+                refresh_norm_cache()
+                count += 1
+
+            refresh_runtime_state = getattr(
+                module, "refresh_weight_dependent_state", None
+            )
+            if refresh_runtime_state is not None:
+                refresh_runtime_state()
+                count += 1
+
         if count > 0:
-            logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
+            logger.info(f"[IpcModelLoader] Rebuilt {count} stale tensor views")
 
     @staticmethod
-    def _set_module_tensor(model, name, tensor, is_param=True):
+    def _set_module_tensor(model, name, tensor, is_param=True, tensor_metadata=None):
         """Replace or register a parameter/buffer in the model by its full dotted name.
 
         This is necessary because setting param.data on a meta-device tensor
@@ -294,6 +332,7 @@ class IpcModelLoader(BaseModelLoader):
             # is inference-only, so autograd must never write into it.
             new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
+            target = new_param
         else:
             # register_buffer raises KeyError if the name already exists as a
             # parameter or plain attribute (not a buffer). This happens when
@@ -304,6 +343,47 @@ class IpcModelLoader(BaseModelLoader):
             elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
+            target = tensor
+
+        for key, value in (tensor_metadata or {}).items():
+            if key not in _IPC_TENSOR_ATTRS:
+                raise RuntimeError(f"Unsupported IPC tensor metadata {key!r}")
+            setattr(target, key, value)
+
+    @staticmethod
+    def _matches_mxfp4_moe_postprocess(module, leaf_name, imported, reference):
+        quant_method = getattr(module, "quant_method", None)
+        if not getattr(quant_method, "is_fp4_expert", False):
+            return False
+
+        if leaf_name in _MXFP4_MOE_WEIGHTS:
+            fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+            return (
+                fp4_dtype is not None
+                and tuple(imported.shape) == tuple(reference.shape)
+                and reference.dtype in (torch.int8, torch.uint8)
+                and imported.dtype == fp4_dtype
+            )
+
+        if leaf_name in _MXFP4_MOE_SCALES:
+            if imported.dtype != reference.dtype:
+                return False
+            if len(reference.shape) != 3 or len(imported.shape) != 2:
+                return False
+            rows = reference.shape[0] * reference.shape[1]
+            padded_cols = (reference.shape[2] + 15) // 16 * 16
+            return tuple(imported.shape) == (rows, padded_cols)
+
+        return False
+
+    @staticmethod
+    def _restore_module_metadata(model, module_metadata):
+        for module_name, metadata in module_metadata.items():
+            module = model.get_submodule(module_name)
+            for key, value in metadata.items():
+                if key not in _IPC_MODULE_ATTRS:
+                    raise RuntimeError(f"Unsupported IPC module metadata {key!r}")
+                setattr(module, key, value)
 
     def _load_zero_copy_mode(
         self,
@@ -311,6 +391,7 @@ class IpcModelLoader(BaseModelLoader):
         device_config,
         entries,
         quant_config,
+        module_metadata,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
@@ -345,7 +426,9 @@ class IpcModelLoader(BaseModelLoader):
             name: param
             for name, param in model.named_parameters(remove_duplicate=False)
         }
-        existing_buffers = {name: buf for name, buf in model.named_buffers()}
+        existing_buffers = {
+            name: buf for name, buf in model.named_buffers(remove_duplicate=False)
+        }
         existing_names = set(existing_params) | set(existing_buffers)
 
         imported_refs = []
@@ -358,18 +441,43 @@ class IpcModelLoader(BaseModelLoader):
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
         for name, entry in entries.items():
+            postprocess_layout = entry.get("postprocess_layout")
+            if postprocess_layout not in (None, "mxfp4_moe"):
+                raise RuntimeError(
+                    f"[IpcModelLoader] Unsupported post-process layout "
+                    f"{postprocess_layout!r} for {name}"
+                )
             imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
-
+            entry_shape = tuple(entry.get("shape", ()))
+            entry_dtype = entry.get("dtype")
+            imported_dtype = str(imported_tensor.dtype).removeprefix("torch.")
+            if (
+                entry_shape != tuple(imported_tensor.shape)
+                or entry_dtype != imported_dtype
+            ):
+                raise RuntimeError(
+                    f"[IpcModelLoader] Invalid transport metadata for {name}: "
+                    f"entry={entry_shape}/{entry_dtype}, "
+                    f"tensor={tuple(imported_tensor.shape)}/{imported_dtype}"
+                )
             if name in existing_names:
                 # Existing parameter/buffer — validate shape/dtype
                 if name in existing_params:
                     ref_param = existing_params[name]
                 else:
                     ref_param = existing_buffers[name]
-                if (
+                module_name, _, leaf_name = name.rpartition(".")
+                module = model.get_submodule(module_name)
+                mismatches_reference = (
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
+                )
+                if mismatches_reference and not (
+                    postprocess_layout == "mxfp4_moe"
+                    and self._matches_mxfp4_moe_postprocess(
+                        module, leaf_name, imported_tensor, ref_param
+                    )
                 ):
                     mismatched.append(
                         f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
@@ -378,8 +486,33 @@ class IpcModelLoader(BaseModelLoader):
                     del imported_tensor
                     continue
 
+                if postprocess_layout == "mxfp4_moe":
+                    required_module_metadata = module_metadata.get(module_name, {})
+                    if not _IPC_MODULE_ATTRS.issubset(required_module_metadata):
+                        mismatched.append(
+                            f"  {name}: missing MXFP4 module metadata "
+                            f"{sorted(_IPC_MODULE_ATTRS - set(required_module_metadata))}"
+                        )
+                        del imported_tensor
+                        continue
+                    if (
+                        leaf_name in _MXFP4_MOE_WEIGHTS
+                        and "is_shuffled" not in entry.get("tensor_metadata", {})
+                    ):
+                        mismatched.append(
+                            f"  {name}: missing MXFP4 is_shuffled metadata"
+                        )
+                        del imported_tensor
+                        continue
+
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            self._set_module_tensor(
+                model,
+                name,
+                imported_tensor,
+                is_param=is_param,
+                tensor_metadata=entry.get("tensor_metadata"),
+            )
             imported_refs.append(imported_tensor)
             imported_count += 1
 
@@ -414,7 +547,9 @@ class IpcModelLoader(BaseModelLoader):
             if param.device.type == "meta"
         ]
         still_on_meta_buffers = [
-            name for name, buf in model.named_buffers() if buf.device.type == "meta"
+            name
+            for name, buf in model.named_buffers(remove_duplicate=False)
+            if buf.device.type == "meta"
         ]
 
         if still_on_meta_params or still_on_meta_buffers:
@@ -432,6 +567,7 @@ class IpcModelLoader(BaseModelLoader):
                 f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
             )
 
+        self._restore_module_metadata(model, module_metadata)
         map_elapsed = time.perf_counter() - map_tic
 
         # Stash IPC refs on the model to prevent GC (which would unmap the memory)

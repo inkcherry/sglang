@@ -72,6 +72,7 @@ class WeightCacheTransportBackend(ABC):
         *,
         config: Dict[str, Any],
         entries: Dict[str, Dict[str, Any]],
+        module_metadata: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
     ) -> None:
@@ -112,6 +113,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         *,
         config: Dict[str, Any],
         entries: Dict[str, Dict[str, Any]],
+        module_metadata: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
     ) -> None:
@@ -121,6 +123,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
                 "status": "ok",
                 "config": config,
                 "entries": entries,
+                "module_metadata": module_metadata,
                 "pid": pid,
                 "transport_backend": self.name,
                 "preloaded_weights_bytes": preloaded_weights_bytes,
@@ -173,6 +176,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         *,
         config: Dict[str, Any],
         entries: Dict[str, Dict[str, Any]],
+        module_metadata: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
     ) -> None:

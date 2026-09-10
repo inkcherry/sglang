@@ -78,6 +78,14 @@ if TYPE_CHECKING:
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
+_IPC_TENSOR_ATTRS = ("is_shuffled", "format_ue8m0")
+_IPC_MODULE_ATTRS = ("intermediate_pad", "hidden_pad")
+_MXFP4_MOE_TENSORS = {
+    "w13_weight",
+    "w2_weight",
+    "w13_weight_scale_inv",
+    "w2_weight_scale_inv",
+}
 
 
 @dataclasses.dataclass
@@ -181,6 +189,7 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.module_metadata: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
 
@@ -421,14 +430,15 @@ class WeightCacheDaemon:
     def _export_state(self):
         """Export model state entries through the selected transport backend."""
         self.state_entries.clear()
+        self.module_metadata.clear()
 
         # remove_duplicate=False so tied weights are recognized as parameters
         # under every name. state_dict() below emits both tied keys, and with the
         # deduped set the duplicate would be mis-registered as a buffer, not a
         # parameter, on the client.
-        param_names = set(
-            name for name, _ in self.model.named_parameters(remove_duplicate=False)
-        )
+        named_params = dict(self.model.named_parameters(remove_duplicate=False))
+        named_buffers = dict(self.model.named_buffers(remove_duplicate=False))
+        param_names = set(named_params)
         state_dict_names = set(self.model.state_dict().keys())
         state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {}
 
@@ -439,13 +449,41 @@ class WeightCacheDaemon:
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
+        for name, buf in self.model.named_buffers(remove_duplicate=False):
             if name not in state_dict_names:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        named_tensors = {**named_buffers, **named_params}
+        for name, entry in self.state_entries.items():
+            tensor = named_tensors.get(name)
+            if tensor is not None:
+                metadata = {
+                    attr: getattr(tensor, attr)
+                    for attr in _IPC_TENSOR_ATTRS
+                    if hasattr(tensor, attr)
+                }
+                if metadata:
+                    entry["tensor_metadata"] = metadata
+
+            module_name, _, leaf_name = name.rpartition(".")
+            module = self.model.get_submodule(module_name)
+            quant_method = getattr(module, "quant_method", None)
+            if leaf_name in _MXFP4_MOE_TENSORS and getattr(
+                quant_method, "is_fp4_expert", False
+            ):
+                entry["postprocess_layout"] = "mxfp4_moe"
+
+        for name, module in self.model.named_modules():
+            metadata = {
+                attr: getattr(module, attr)
+                for attr in _IPC_MODULE_ATTRS
+                if hasattr(module, attr)
+            }
+            if metadata:
+                self.module_metadata[name] = metadata
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
@@ -583,6 +621,7 @@ class WeightCacheDaemon:
                 conn,
                 config=self.config.to_dict(),
                 entries=self.state_entries,
+                module_metadata=self.module_metadata,
                 # PID so the client can watch daemon liveness: if this
                 # process dies while clients hold IPC mappings, their
                 # param.data (and any CUDA-graph-captured addresses) dangle.
