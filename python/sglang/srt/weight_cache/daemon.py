@@ -78,14 +78,6 @@ if TYPE_CHECKING:
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
-_IPC_TENSOR_ATTRS = ("is_shuffled", "format_ue8m0")
-_IPC_MODULE_ATTRS = ("intermediate_pad", "hidden_pad")
-_MXFP4_MOE_TENSORS = {
-    "w13_weight",
-    "w2_weight",
-    "w13_weight_scale_inv",
-    "w2_weight_scale_inv",
-}
 
 
 @dataclasses.dataclass
@@ -459,31 +451,26 @@ class WeightCacheDaemon:
         named_tensors = {**named_buffers, **named_params}
         for name, entry in self.state_entries.items():
             tensor = named_tensors.get(name)
-            if tensor is not None:
-                metadata = {
-                    attr: getattr(tensor, attr)
-                    for attr in _IPC_TENSOR_ATTRS
-                    if hasattr(tensor, attr)
-                }
-                if metadata:
-                    entry["tensor_metadata"] = metadata
-
             module_name, _, leaf_name = name.rpartition(".")
             module = self.model.get_submodule(module_name)
             quant_method = getattr(module, "quant_method", None)
-            if leaf_name in _MXFP4_MOE_TENSORS and getattr(
-                quant_method, "is_fp4_expert", False
-            ):
-                entry["postprocess_layout"] = "mxfp4_moe"
+            get_metadata = getattr(
+                quant_method, "get_weight_cache_tensor_metadata", None
+            )
+            if tensor is not None and get_metadata is not None:
+                metadata = get_metadata(module, leaf_name, tensor)
+                if metadata:
+                    entry["tensor_metadata"] = metadata
 
         for name, module in self.model.named_modules():
-            metadata = {
-                attr: getattr(module, attr)
-                for attr in _IPC_MODULE_ATTRS
-                if hasattr(module, attr)
-            }
-            if metadata:
-                self.module_metadata[name] = metadata
+            quant_method = getattr(module, "quant_method", None)
+            get_metadata = getattr(
+                quant_method, "get_weight_cache_module_metadata", None
+            )
+            if get_metadata is not None:
+                metadata = get_metadata(module)
+                if metadata:
+                    self.module_metadata[name] = metadata
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:

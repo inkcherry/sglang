@@ -458,6 +458,8 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
+    weight_cache_tensor_attrs = ("format_ue8m0",)
+
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
@@ -1083,6 +1085,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
+    weight_cache_tensor_attrs = ("is_shuffled", "format_ue8m0")
+    weight_cache_module_attrs = ("intermediate_pad", "hidden_pad")
+    _weight_cache_fp4_weights = ("w13_weight", "w2_weight")
+    _weight_cache_fp4_scales = ("w13_weight_scale_inv", "w2_weight_scale_inv")
+
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
@@ -1107,6 +1114,60 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 or get_platform().is_sm90
                 or get_platform().is_sm120
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
+
+    def restore_weight_cache_tensor_metadata(
+        self,
+        layer: Module,
+        name: str,
+        tensor: torch.Tensor,
+        metadata: Dict[str, Any],
+    ) -> None:
+        if (
+            self.is_fp4_expert
+            and name in self._weight_cache_fp4_weights
+            and "is_shuffled" not in metadata
+        ):
+            raise RuntimeError(f"Missing is_shuffled metadata for MXFP4 tensor {name}")
+        super().restore_weight_cache_tensor_metadata(layer, name, tensor, metadata)
+
+    def restore_weight_cache_module_metadata(
+        self, layer: Module, metadata: Dict[str, Any]
+    ) -> None:
+        if self.is_fp4_expert:
+            missing = set(self.weight_cache_module_attrs) - set(metadata)
+            if missing:
+                raise RuntimeError(f"Missing MXFP4 module metadata: {sorted(missing)}")
+        super().restore_weight_cache_module_metadata(layer, metadata)
+
+    def is_weight_cache_tensor_compatible(
+        self,
+        layer: Module,
+        name: str,
+        imported: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> bool:
+        if not self.is_fp4_expert:
+            return False
+
+        if name in self._weight_cache_fp4_weights:
+            fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+            return (
+                fp4_dtype is not None
+                and tuple(imported.shape) == tuple(reference.shape)
+                and reference.dtype in (torch.int8, torch.uint8)
+                and imported.dtype == fp4_dtype
+            )
+
+        if name in self._weight_cache_fp4_scales:
+            if imported.dtype != reference.dtype:
+                return False
+            if len(reference.shape) != 3 or len(imported.shape) != 2:
+                return False
+            rows = reference.shape[0] * reference.shape[1]
+            padded_cols = (reference.shape[2] + 15) // 16 * 16
+            return tuple(imported.shape) == (rows, padded_cols)
+
+        return False
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled(

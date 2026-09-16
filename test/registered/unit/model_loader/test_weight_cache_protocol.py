@@ -175,7 +175,17 @@ class TestIpcPostprocessMetadata(CustomTestCase):
 
         model = torch.nn.Module()
         model.experts = torch.nn.Module()
-        model.experts.quant_method = SimpleNamespace(is_fp4_expert=True)
+        model.experts.quant_method = SimpleNamespace(
+            get_weight_cache_tensor_metadata=lambda _layer, _name, tensor: (
+                {"is_shuffled": tensor.is_shuffled}
+                if hasattr(tensor, "is_shuffled")
+                else {}
+            ),
+            get_weight_cache_module_metadata=lambda layer: {
+                "intermediate_pad": layer.intermediate_pad,
+                "hidden_pad": layer.hidden_pad,
+            },
+        )
         model.experts.intermediate_pad = 0
         model.experts.hidden_pad = 0
         weight = torch.nn.Parameter(torch.ones(2), requires_grad=False)
@@ -209,7 +219,6 @@ class TestIpcPostprocessMetadata(CustomTestCase):
             cache._export_state()
 
         entry = cache.state_entries["experts.w13_weight"]
-        self.assertEqual(entry["postprocess_layout"], "mxfp4_moe")
         self.assertEqual(entry["tensor_metadata"], {"is_shuffled": True})
         self.assertIn("cache_a.freqs_cis", cache.state_entries)
         self.assertIn("cache_b.freqs_cis", cache.state_entries)
@@ -218,7 +227,8 @@ class TestIpcPostprocessMetadata(CustomTestCase):
             {"intermediate_pad": 0, "hidden_pad": 0},
         )
 
-    def test_set_module_tensor_restores_tensor_metadata(self):
+    def test_quant_method_restores_tensor_metadata(self):
+        from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 
         model = torch.nn.Module()
@@ -226,11 +236,18 @@ class TestIpcPostprocessMetadata(CustomTestCase):
             "weight",
             torch.nn.Parameter(torch.empty(2, device="meta"), requires_grad=False),
         )
-        IpcModelLoader._set_module_tensor(
+        target = IpcModelLoader._set_module_tensor(
             model,
             "weight",
             torch.ones(2),
-            tensor_metadata={"is_shuffled": True},
+        )
+        quant_method = SimpleNamespace(weight_cache_tensor_attrs=("is_shuffled",))
+        QuantizeMethodBase.restore_weight_cache_tensor_metadata(
+            quant_method,
+            model,
+            "weight",
+            target,
+            {"is_shuffled": True},
         )
         self.assertTrue(model.weight.is_shuffled)
         self.assertTrue(torch.equal(model.weight, torch.ones(2)))
@@ -240,6 +257,11 @@ class TestIpcPostprocessMetadata(CustomTestCase):
 
         model = torch.nn.Module()
         model.experts = torch.nn.Module()
+        model.experts.quant_method = SimpleNamespace(
+            restore_weight_cache_module_metadata=lambda layer, metadata: [
+                setattr(layer, key, value) for key, value in metadata.items()
+            ]
+        )
         IpcModelLoader._restore_module_metadata(
             model,
             {"experts": {"intermediate_pad": 128, "hidden_pad": 0}},
@@ -295,18 +317,20 @@ class TestIpcPostprocessMetadata(CustomTestCase):
         )
 
     def test_mxfp4_scale_postprocess_shape(self):
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
-        module = SimpleNamespace(quant_method=SimpleNamespace(is_fp4_expert=True))
+        quant_method = Fp8MoEMethod.__new__(Fp8MoEMethod)
+        quant_method.is_fp4_expert = True
+        module = SimpleNamespace()
         reference = torch.empty(385, 7168, 12, dtype=torch.uint8, device="meta")
         imported = torch.empty(385 * 7168, 16, dtype=torch.uint8, device="meta")
         self.assertTrue(
-            IpcModelLoader._matches_mxfp4_moe_postprocess(
+            quant_method.is_weight_cache_tensor_compatible(
                 module, "w2_weight_scale_inv", imported, reference
             )
         )
         self.assertFalse(
-            IpcModelLoader._matches_mxfp4_moe_postprocess(
+            quant_method.is_weight_cache_tensor_compatible(
                 module,
                 "w2_weight_scale_inv",
                 torch.empty(385 * 7168, 15, dtype=torch.uint8, device="meta"),
@@ -315,31 +339,48 @@ class TestIpcPostprocessMetadata(CustomTestCase):
         )
 
     def test_mxfp4_weight_postprocess_dtype(self):
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
         fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
         if fp4_dtype is None:
             self.skipTest("torch build has no packed FP4 dtype")
-        module = SimpleNamespace(quant_method=SimpleNamespace(is_fp4_expert=True))
+        quant_method = Fp8MoEMethod.__new__(Fp8MoEMethod)
+        quant_method.is_fp4_expert = True
+        module = SimpleNamespace()
         reference = SimpleNamespace(shape=(385, 768, 3584), dtype=torch.int8)
         imported = SimpleNamespace(shape=reference.shape, dtype=fp4_dtype)
         self.assertTrue(
-            IpcModelLoader._matches_mxfp4_moe_postprocess(
+            quant_method.is_weight_cache_tensor_compatible(
                 module, "w13_weight", imported, reference
             )
         )
 
-    def test_unknown_metadata_is_rejected(self):
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+    def test_mxfp4_metadata_is_required(self):
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
-        model = torch.nn.Module()
-        model.register_parameter("weight", torch.nn.Parameter(torch.ones(1)))
+        quant_method = Fp8MoEMethod.__new__(Fp8MoEMethod)
+        quant_method.is_fp4_expert = True
         with self.assertRaises(RuntimeError):
-            IpcModelLoader._set_module_tensor(
-                model,
+            quant_method.restore_weight_cache_module_metadata(SimpleNamespace(), {})
+        with self.assertRaises(RuntimeError):
+            quant_method.restore_weight_cache_tensor_metadata(
+                SimpleNamespace(),
+                "w13_weight",
+                torch.ones(1),
+                {},
+            )
+
+    def test_unknown_metadata_is_rejected(self):
+        from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+
+        quant_method = SimpleNamespace(weight_cache_tensor_attrs=())
+        with self.assertRaises(RuntimeError):
+            QuantizeMethodBase.restore_weight_cache_tensor_metadata(
+                quant_method,
+                torch.nn.Module(),
                 "weight",
                 torch.ones(1),
-                tensor_metadata={"weight_loader": "unsafe"},
+                {"weight_loader": "unsafe"},
             )
 
 

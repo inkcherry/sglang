@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
 
+    weight_cache_tensor_attrs: tuple[str, ...] = ()
+    weight_cache_module_attrs: tuple[str, ...] = ()
+
     def create_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
     ):
@@ -45,6 +48,57 @@ class QuantizeMethodBase(ABC):
         This can be used for example, to transpose weights for computation.
         """
         return
+
+    def get_weight_cache_tensor_metadata(
+        self, layer: nn.Module, name: str, tensor: torch.Tensor
+    ) -> Dict[str, Any]:
+        return {
+            attr: getattr(tensor, attr)
+            for attr in self.weight_cache_tensor_attrs
+            if hasattr(tensor, attr)
+        }
+
+    def restore_weight_cache_tensor_metadata(
+        self,
+        layer: nn.Module,
+        name: str,
+        tensor: torch.Tensor,
+        metadata: Dict[str, Any],
+    ) -> None:
+        unsupported = set(metadata) - set(self.weight_cache_tensor_attrs)
+        if unsupported:
+            raise RuntimeError(
+                f"Unsupported weight-cache tensor metadata: {sorted(unsupported)}"
+            )
+        for key, value in metadata.items():
+            setattr(tensor, key, value)
+
+    def get_weight_cache_module_metadata(self, layer: nn.Module) -> Dict[str, Any]:
+        return {
+            attr: getattr(layer, attr)
+            for attr in self.weight_cache_module_attrs
+            if hasattr(layer, attr)
+        }
+
+    def restore_weight_cache_module_metadata(
+        self, layer: nn.Module, metadata: Dict[str, Any]
+    ) -> None:
+        unsupported = set(metadata) - set(self.weight_cache_module_attrs)
+        if unsupported:
+            raise RuntimeError(
+                f"Unsupported weight-cache module metadata: {sorted(unsupported)}"
+            )
+        for key, value in metadata.items():
+            setattr(layer, key, value)
+
+    def is_weight_cache_tensor_compatible(
+        self,
+        layer: nn.Module,
+        name: str,
+        imported: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> bool:
+        return False
 
 
 class LinearMethodBase(QuantizeMethodBase):
