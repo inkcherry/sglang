@@ -457,7 +457,7 @@ class Compressor(BaseFusedOp):
     def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
         weight = getattr(self.wkv_gate, "weight", None)
         if weight is not None:
-            if _use_aiter and weight.dtype == torch.bfloat16:
+            if False and _use_aiter and weight.dtype == torch.bfloat16:
                 # aiter's tuned GEMM for these shapes; kv_score is bf16-rounded
                 return tgemm.mm(x, weight, otype=x.dtype).float()
             return linear_bf16_fp32(x, weight)

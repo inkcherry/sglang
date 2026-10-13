@@ -502,7 +502,8 @@ def handle_model_specific_adjustments(server_args: Any):
             _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(True)
-            envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
+            if not envs.SGLANG_OPT_USE_AITER_INDEXER.is_set():
+                envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
