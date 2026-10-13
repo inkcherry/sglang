@@ -207,7 +207,27 @@ class PagedIndexerMetadata:
         if (
             is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ) and not self.force_deep_gemm_metadata:
-            self.deep_gemm_metadata = None
+            num_rows = self.compressed_seq_lens.shape[0]
+            self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
+            self.rows_per_chunk = (
+                mqa_logits_rows_per_chunk(
+                    num_rows=num_rows,
+                    row_bytes=mqa_logits_row_bytes(self.max_compressed_seq_len) * 192,
+                    budget_bytes=self.mqa_logits_budget_bytes,
+                )
+                if self.mqa_logits_budget_bytes is not None
+                else None
+            )
+            self.deep_gemm_metadata = (
+                [
+                    None
+                    for _ in iter_row_chunks(
+                        num_rows=num_rows, rows_per_chunk=self.rows_per_chunk
+                    )
+                ]
+                if self.rows_per_chunk is not None
+                else None
+            )
         else:
             import deep_gemm
 
